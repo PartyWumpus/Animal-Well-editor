@@ -4,12 +4,15 @@ project(Animal_Well_Editor C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 
+add_definitions(-w)
+
 find_package(OpenGL REQUIRED)
 
 if(WIN32)
     set(LIBS OpenGL32)
 elseif(UNIX)
-    find_package(GTK2 REQUIRED gtk)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GTK2 REQUIRED gtk+-2.0)
 
     set(INCLUDES ${GTK2_INCLUDE_DIRS})
     set(LIBS GL ${GTK2_LIBRARIES} stdc++fs pthread)
@@ -41,7 +44,7 @@ add_executable(editor ${Common_sources} ${imgui_sources}
     "./lib/glad/src/gl.c"
     "./lib/nativefiledialog/nfd.cpp")
 
-target_include_directories(editor PRIVATE "lib/imgui" "lib/stb" "lib/glm" "lib/glad/include" "lib/nativefiledialog" glfw)
+target_include_directories(editor PRIVATE "lib/imgui" "lib/stb" "lib/glm" "lib/glad/include" "lib/nativefiledialog" glfw ${INCLUDES})
 target_link_libraries(editor PRIVATE glfw ${LIBS})
 set_target_properties(editor PROPERTIES WIN32_EXECUTABLE TRUE) 
 
