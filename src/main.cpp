@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
-#include <numbers>
 #include <random>
 #include <set>
 #include <span>
@@ -22,6 +21,8 @@
 #include "structures/entity.hpp"
 #include "structures/map.hpp"
 #include "structures/tile.hpp"
+#include "rendering.hpp"
+
 #include "dos_parser.hpp"
 
 #include "windows/errors.hpp"
@@ -38,9 +39,9 @@ GLFWwindow* window;
 float gScale = 1;
 // Camera matrix
 glm::mat4 view = glm::lookAt(
-    glm::vec3(0, 0, 3),  // Camera is at (0, 0, 3), in World Space
-    glm::vec3(0, 0, 0),  // and looks at the origin
-    glm::vec3(0, 1, 0)   // Head is up
+    glm::vec3(0, 0, 3), // Camera is at (0, 0, 3), in World Space
+    glm::vec3(0, 0, 0), // and looks at the origin
+    glm::vec3(0, 1, 0)  // Head is up
 );
 glm::mat4 projection;
 glm::mat4 MVP;
@@ -50,50 +51,43 @@ glm::vec2 mousePos = glm::vec2(-1);
 glm::vec2 screenSize;
 
 std::vector<Textured_Framebuffer*> framebuffers;
-
-std::unique_ptr<VBO> VBO_fg;
-std::unique_ptr<VBO> VBO_bg;
-std::unique_ptr<VBO> VBO_bg_tex;
-std::unique_ptr<VBO> VBO_light;
-std::unique_ptr<VBO> VBO_selection;
+std::unique_ptr<Mesh> fg_tiles, bg_tiles, bg_text, lights, overlay;
 
 int selectedMap = 0;
 
 std::vector<char> rawData;
 
-constexpr int mapIds[5] = { 300, 193, 52, 222, 157 };
-Map maps[5]{};
+static const char* mapNames[5] = {"Overworld", "CE temple", "Space", "Bunny temple", "Time Capsule"};
+constexpr int mapIds[5] = {300, 157, 193, 52, 222};
+
+Map maps[5] {};
 std::unordered_map<uint32_t, SpriteData> sprites;
 std::vector<uv_data> uvs;
 
 std::unique_ptr<Texture> atlas;
 std::unique_ptr<Texture> bg_tex;
 
-std::vector<glm::vec4> vertecies_fg;
-std::vector<glm::vec4> vertecies_bg;
-std::vector<std::pair<glm::vec2, glm::vec3>> vertecies_bg_tex;
-std::vector<std::pair<glm::vec2, glm::vec3>> vertecies_light;
-std::vector<std::pair<glm::vec2, glm::vec4>> selectionVerts;
-
-glm::vec4 bg_color{ 0.8, 0.8, 0.8, 1 };
-glm::vec4 fg_color{ 1, 1, 1, 1 };
-glm::vec4 bg_tex_color{ 0.5, 0.5, 0.5, 1 };
+glm::vec4 bg_color {0.8, 0.8, 0.8, 1};
+glm::vec4 fg_color {1, 1, 1, 1};
+glm::vec4 bg_tex_color {0.5, 0.5, 0.5, 1};
 
 bool show_fg = true;
 bool show_bg = true;
 bool show_bg_tex = true;
 bool do_lighting = false;
+bool room_grid = false;
+bool show_water = false;
 
 static void glfw_error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
 static void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
-    glm::vec2 newPos{xpos, ypos};
-    if (mousePos == newPos)
+    glm::vec2 newPos {xpos, ypos};
+    if(mousePos == newPos)
         return;
 
-    if (mousePos == glm::vec2(-1)) {
+    if(mousePos == glm::vec2(-1)) {
         mousePos = newPos;
         return;
     }
@@ -101,11 +95,11 @@ static void cursor_position_callback(GLFWwindow* window, double xpos, double ypo
     mousePos = newPos;
 
     ImGuiIO& io = ImGui::GetIO();
-    if (io.WantCaptureMouse) {
+    if(io.WantCaptureMouse) {
         return;
     }
 
-    if (glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT)) {
+    if(glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT)) {
         view = glm::translate(view, glm::vec3(-delta / gScale, 0));
     }
 }
@@ -117,10 +111,10 @@ static void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) 
     }
 
     float scale = 1;
-    if (yoffset > 0) {
-        scale = 1.1;
-    } else if (yoffset < 0) {
-        scale = 1 / 1.1;
+    if(yoffset > 0) {
+        scale = 1.1f;
+    } else if(yoffset < 0) {
+        scale = 1 / 1.1f;
     }
 
     auto mp = glm::vec4(((mousePos - screenSize / 2.0f) / screenSize) * 2.0f, 0, 1);
@@ -143,298 +137,21 @@ static void onResize(GLFWwindow* window, int width, int height) {
     }
 }
 
-auto renderMap(const Map& map, int layer) {
-    auto atlasSize = glm::vec2(atlas->width, atlas->height);
-
-    std::vector<glm::vec4> vert;
-
-    for (auto&& room : map.rooms) {
-        for (int y2 = 0; y2 < 22; y2++) {
-            for (int x2 = 0; x2 < 40; x2++) {
-                auto tile = room.tiles[layer][y2][x2];
-                // assert((tile & 0xFFFF0000) == 0);
-                if (tile.tile_id == 0 || tile.tile_id >= 0x400) continue;
-
-                auto pos = glm::vec2(x2 + room.x * 40, y2 + room.y * 22);
-                pos *= 8;
-                auto uv = uvs[tile.tile_id];
-
-                if (sprites.contains(tile.tile_id)) {
-                    auto& sprite = sprites[tile.tile_id];
-                    // __debugbreak();
-
-                    int composition_id = 0;
-
-                    for (int j = 0; j < sprite.layer_count; ++j) {
-                        auto subsprite_id = sprite.compositions[composition_id * sprite.layer_count + j];
-                        if (subsprite_id >= sprite.subsprite_count)
-                            continue;
-
-                        auto& layer = sprite.layers[j];
-                        if (layer.is_normals1 || layer.is_normals2 || !layer.is_visible) continue;
-
-                        auto& subsprite = sprite.sub_sprites[subsprite_id];
-
-                        auto aUv = glm::vec2(uv.pos + subsprite.atlas_pos);
-                        auto size = glm::vec2(subsprite.size);
-                        auto ap = pos + glm::vec2(subsprite.composite_pos);
-
-                        if (tile.vertical_mirror) {
-                            ap.y = pos.y + (sprite.composite_size.y - (subsprite.composite_pos.y + subsprite.size.y));
-                            aUv.y += size.y;
-                            size.y = -size.y;
-                        }
-                        if (tile.horizontal_mirror) {
-                            ap.x = pos.x + (sprite.composite_size.x - (subsprite.composite_pos.x + subsprite.size.x));
-                            aUv.x += size.x;
-                            size.x = -size.x;
-                        }
-                        assert(!tile.rotate_90 && !tile.rotate_180); // sprite rotation not implemented
-
-                        vert.emplace_back(ap, aUv / atlasSize);                                                                // tl
-                        vert.emplace_back(ap + glm::vec2(subsprite.size.x, 0), glm::vec2(aUv.x + size.x, aUv.y) / atlasSize);  // tr
-                        vert.emplace_back(ap + glm::vec2(0, subsprite.size.y), glm::vec2(aUv.x, aUv.y + size.y) / atlasSize);  // bl
-
-                        vert.emplace_back(ap + glm::vec2(subsprite.size.x, 0), glm::vec2(aUv.x + size.x, aUv.y) / atlasSize);  // tr
-                        vert.emplace_back(ap + glm::vec2(subsprite.size), (aUv + size) / atlasSize);                           // br
-                        vert.emplace_back(ap + glm::vec2(0, subsprite.size.y), glm::vec2(aUv.x, aUv.y + size.y) / atlasSize);  // bl
-                    }
-                } else {
-                    auto right = glm::vec2(uv.size.x, 0);
-                    auto down = glm::vec2(0, uv.size.y);
-
-                    if (uv.contiguous || uv.self_contiguous) {
-                        bool l, r, u, d;
-
-                        auto l_ = map.getTile(layer, x2 + room.x * 40 - 1, y2 + room.y * 22);
-                        auto r_ = map.getTile(layer, x2 + room.x * 40 + 1, y2 + room.y * 22);
-                        auto u_ = map.getTile(layer, x2 + room.x * 40, y2 + room.y * 22 - 1);
-                        auto d_ = map.getTile(layer, x2 + room.x * 40, y2 + room.y * 22 + 1);
-
-                        if (uv.self_contiguous) {
-                            l = l_.has_value() && l_.value().tile_id == tile.tile_id;
-                            r = r_.has_value() && r_.value().tile_id == tile.tile_id;
-                            u = u_.has_value() && u_.value().tile_id == tile.tile_id;
-                            d = d_.has_value() && d_.value().tile_id == tile.tile_id;
-                        } else {
-                            l = !l_.has_value() || uvs[l_.value().tile_id].collides_right;
-                            r = !r_.has_value() || uvs[r_.value().tile_id].collides_left;
-                            u = !u_.has_value() || uvs[u_.value().tile_id].collides_down;
-                            d = !d_.has_value() || uvs[d_.value().tile_id].collides_up;
-                        }
-
-                        if (l && r && u && d) {
-                            uv.pos.x += 8;
-                            uv.pos.y += 8;
-                        } else if (l && r && d) {
-                            uv.pos.x += 8;
-                        } else if (l && u && d) {
-                            uv.pos.x += 16;
-                            uv.pos.y += 8;
-                        } else if (l && u && r) {
-                            uv.pos.x += 8;
-                            uv.pos.y += 16;
-                        } else if (u && d && r) {
-                            uv.pos.y += 8;
-                        } else if (l && u) {
-                            uv.pos.x += 16;
-                            uv.pos.y += 16;
-                        } else if (l && d) {
-                            uv.pos.x += 16;
-                        } else if (u && r) {
-                            uv.pos.y += 16;
-                        } else if (d && r) {
-                            // default
-                        } else if (l && r) {
-                            uv.pos.x += 8;
-                            uv.pos.y += 24;
-                        } else if (u && d) {
-                            uv.pos.x += 24;
-                            uv.pos.y += 8;
-                        } else if (l) {
-                            uv.pos.x += 16;
-                            uv.pos.y += 24;
-                        } else if (r) {
-                            uv.pos.y += 24;
-                        } else if (u) {
-                            uv.pos.x += 24;
-                            uv.pos.y += 16;
-                        } else if (d) {
-                            uv.pos.x += 24;
-                        } else {
-                            uv.pos.x += 24;
-                            uv.pos.y += 24;
-                        }
-                    } else {  // flags ignore for tiling
-                        if (tile.vertical_mirror) {
-                            uv.pos += down;
-                            down = -down;
-                        }
-                        if (tile.horizontal_mirror) {
-                            uv.pos += right;
-                            right = -right;
-                        }
-                        if (tile.rotate_90) {
-                            std::tie(uv.size.x, uv.size.y) = std::tie(uv.size.y, uv.size.x);  // flip size
-                            uv.pos += down;
-                            std::tie(down, right) = std::pair(right, -down);
-                        }
-                        if (tile.rotate_180) {
-                            uv.pos += down + right;
-                            down = -down;
-                            right = -right;
-                        }
-                    }
-                    auto uvp = glm::vec2(uv.pos);
-
-                    vert.emplace_back(pos                          , uvp / atlasSize);           // tl
-                    vert.emplace_back(pos + glm::vec2(uv.size.x, 0), (uvp + right) / atlasSize); // tr
-                    vert.emplace_back(pos + glm::vec2(0, uv.size.y), (uvp + down) / atlasSize);  // bl
-
-                    vert.emplace_back(pos + glm::vec2(uv.size.x, 0), (uvp + right) / atlasSize);   // tr
-                    vert.emplace_back(pos + glm::vec2(uv.size), (uvp + down + right) / atlasSize); // br
-                    vert.emplace_back(pos + glm::vec2(0, uv.size.y), (uvp + down) / atlasSize);    // bl
-                }
-            }
-        }
-    }
-
-    return vert;
-}
-
-auto renderBgs(const Map& map) {
-    std::vector<std::pair<glm::vec2, glm::vec3>> bg;
-
-    for(auto&& room : map.rooms) {
-        auto rp = glm::vec2(room.x * 40 * 8, room.y * 22 * 8);
-
-        if(room.bgId != 0) {
-            bg.push_back({ rp                        , { 0, 0, room.bgId - 1 } }); // tl
-            bg.push_back({ { rp.x + 320, rp.y }      , { 1, 0, room.bgId - 1 } }); // tr
-            bg.push_back({ { rp.x      , rp.y + 176 }, { 0, 1, room.bgId - 1 } }); // bl
-
-            bg.push_back({ { rp.x + 320, rp.y }      , { 1, 0, room.bgId - 1 } }); // tr
-            bg.push_back({ { rp.x + 320, rp.y + 176 }, { 1, 1, room.bgId - 1 } }); // br
-            bg.push_back({ { rp.x      , rp.y + 176 }, { 0, 1, room.bgId - 1 } }); // bl
-        }
-    }
-    return bg;
-}
-
-auto renderLights(const Map& map, std::vector<uv_data>& uvs) {
-    std::vector<glm::ivec2> lights; // not really needed. i'll remove it later
-
-    for(auto&& room : map.rooms) {
-        for(int y2 = 0; y2 < 22; y2++) {
-            for(int x2 = 0; x2 < 40; x2++) {
-                auto tile = room.tiles[0][y2][x2];
-                if(tile.tile_id == 0 || tile.tile_id >= 0x400)
-                    continue;
-
-                if(tile.tile_id == 202 || tile.tile_id == 554 || tile.tile_id == 561 || tile.tile_id == 624 || tile.tile_id == 731 || tile.tile_id == 548 || tile.tile_id == 46) {
-                    lights.emplace_back(x2 + room.x * 40, y2 + room.y * 22);
-                }
-            }
-        }
-    }
-
-    // radius ~6 tiles
-
-    // general concept is to render the light circle and the block out everything not reachable by rendering over it with black triangles
-    // currently has issues with light sources rendering over each other
-    // will need to implement cutting the light circle polygon to remove problems and reduce number of triangles rendered
-
-    std::vector<std::pair<glm::vec2, glm::vec3>> verts;
-    auto black = glm::vec3(0, 0, 0);
-    auto col1 = glm::vec3(0.10588, 0.31373, 0.54902);
-    auto col2 = glm::vec3(0.30588, 0.64314, 0.78431);
-
-    auto add_shadow = [&](glm::vec2 pos, glm::ivec2 d1, glm::ivec2 d2) {
-        d1 -= 4.0f;
-        d2 -= 4.0f;
-
-        auto bl = pos + glm::vec2(d1);
-        auto br = pos + glm::vec2(d2);
-        auto tl = pos + glm::normalize(glm::vec2(d1)) * 55.0f;
-        auto tr = pos + glm::normalize(glm::vec2(d2)) * 55.0f;
-
-        verts.emplace_back(tl, black);
-        verts.emplace_back(tr, black);
-        verts.emplace_back(bl, black);
-
-        verts.emplace_back(tr, black);
-        verts.emplace_back(br, black);
-        verts.emplace_back(bl, black);
-    };
-
-    for(auto light : lights) {
-        auto lp = glm::vec2(light * 8) + 4.0f;
-
-        const auto step = std::numbers::pi * 2 / 24;
-        double angle = 0;
-        auto p0 = glm::round(glm::vec2(std::cos(angle), std::sin(angle)) * 53.0f);
-
-        for(int i = 0; i < 24; i++) {
-            verts.emplace_back(lp, col1);
-            verts.emplace_back(lp + p0, col1);
-            angle += step;
-            p0 = glm::round(glm::vec2(std::cos(angle), std::sin(angle)) * 53.0f);
-            verts.emplace_back(lp + p0, col1);
-        }
-
-        angle = 0;
-        p0 = glm::round(glm::vec2(std::cos(angle), std::sin(angle)) * 45.0f);
-
-        for(int i = 0; i < 24; i++) {
-            verts.emplace_back(lp, col2);
-            verts.emplace_back(lp + p0, col2);
-            angle += step;
-            p0 = glm::round(glm::vec2(std::cos(angle), std::sin(angle)) * 45.0f);
-            verts.emplace_back(lp + p0, col2);
-        }
-
-        for(int y = -6; y <= 6; ++y) {
-            for(int x = -6; x <= 6; ++x) {
-                auto t = map.getTile(0, light.x + x, light.y + y);
-                if(!t.has_value() || t->tile_id == 0 || !uvs[t->tile_id].blocks_light)
-                    continue;
-
-                if(y > 0) { // top of tile hit
-                    add_shadow(lp, glm::ivec2(x, y) * 8    , glm::ivec2(x + 1, y) * 8);
-                } else if(y < 0) { // bottom of tile hit
-                    add_shadow(lp, glm::ivec2(x, y + 1) * 8, glm::ivec2(x + 1, y + 1) * 8);
-                }
-                if(x > 0) { // left of tile hit
-                    add_shadow(lp, glm::ivec2(x, y) * 8    , glm::ivec2(x, y + 1) * 8);
-                } else if(x < 0) { // right of tile hit
-                    add_shadow(lp, glm::ivec2(x + 1, y) * 8, glm::ivec2(x + 1, y + 1) * 8);
-                }
-            }
-        }
-    }
-
-    return verts;
-}
-
 static void updateRender() {
-    vertecies_fg = renderMap(maps[selectedMap], 0);
-    vertecies_bg = renderMap(maps[selectedMap], 1);
-    vertecies_bg_tex = renderBgs(maps[selectedMap]);
-    vertecies_light = renderLights(maps[selectedMap], uvs);
-
-    VBO_fg->BufferData(vertecies_fg.data(), vertecies_fg.size() * sizeof(glm::vec4));
-    VBO_bg->BufferData(vertecies_bg.data(), vertecies_bg.size() * sizeof(glm::vec4));
-    VBO_bg_tex->BufferData(vertecies_bg_tex.data(), vertecies_bg_tex.size() * sizeof(float) * 5);
-    VBO_light->BufferData(vertecies_light.data(), vertecies_light.size() * sizeof(float) * 5);
+    renderMap(maps[selectedMap], uvs, sprites, *fg_tiles, 0);
+    renderMap(maps[selectedMap], uvs, sprites, *bg_tiles, 1);
+    renderBgs(maps[selectedMap], *bg_text);
+    renderLights(maps[selectedMap], uvs, *lights);
 }
 
-// helpger function renders a quad over the entire screen with uv fron (0,0) to (1,1)
-// very useful for processing intermediate frambuffers
+// helper function renders a quad over the entire screen with uv fron (0,0) to (1,1)
+// very useful for processing intermediate framebuffers
 static void RenderQuad() {
     static std::unique_ptr<VAO> quadVAO;
     static std::unique_ptr<VBO> quadVBO;
 
     if(quadVAO == nullptr) {
+        // clang-format off
         const float quadVertices[] = {
             // positions  // texture Coords
             -1.0f,  1.0f, 0.0f, 1.0f,
@@ -442,6 +159,7 @@ static void RenderQuad() {
              1.0f,  1.0f, 1.0f, 1.0f,
              1.0f, -1.0f, 1.0f, 0.0f,
         };
+        // clang-format on
 
         quadVAO = std::make_unique<VAO>();
         quadVAO->Bind();
@@ -459,35 +177,6 @@ static void RenderQuad() {
     glBindVertexArray(0);
 }
 
-static void DrawLine(std::vector<std::pair<glm::vec2, glm::vec4>>& verts, glm::vec2 p1, glm::vec2 p2, glm::vec4 color, float thickness) {
-    auto d = glm::normalize(p2 - p1) * (thickness * 0.5f);
-
-    verts.emplace_back(glm::vec2{ p1.x + d.y, p1.y - d.x }, color); // tl
-    verts.emplace_back(glm::vec2{ p2.x + d.y, p2.y - d.x }, color); // tr
-    verts.emplace_back(glm::vec2{ p1.x - d.y, p1.y + d.x }, color); // bl
-
-    verts.emplace_back(glm::vec2{ p2.x - d.y, p2.y + d.x }, color); // br
-    verts.emplace_back(glm::vec2{ p1.x - d.y, p1.y + d.x }, color); // bl
-    verts.emplace_back(glm::vec2{ p2.x + d.y, p2.y - d.x }, color); // tr
-}
-
-static void DrawRect(std::vector<std::pair<glm::vec2, glm::vec4>>& verts, glm::vec2 pos, glm::vec2 size, glm::vec4 color, float thickness) {
-    DrawLine(verts, pos, pos + glm::vec2(size.x, 0), color, thickness);
-    DrawLine(verts, pos + glm::vec2(size.x, 0), pos + size, color, thickness);
-    DrawLine(verts, pos + size, pos + glm::vec2(0, size.y), color, thickness);
-    DrawLine(verts, pos + glm::vec2(0, size.y), pos, color, thickness);
-}
-
-static void DrawCube(std::vector<std::pair<glm::vec2, glm::vec4>>& verts, glm::vec2 p1, glm::vec2 size, glm::vec4 color) {
-    verts.emplace_back(p1, color);
-    verts.emplace_back(glm::vec2{ p1.x + size.x, p1.y }, color);
-    verts.emplace_back(glm::vec2{ p1.x, p1.y + size.y }, color);
-
-    verts.emplace_back(glm::vec2{ p1.x + size.x, p1.y }, color);
-    verts.emplace_back(p1 + size, color);
-    verts.emplace_back(glm::vec2{ p1.x, p1.y + size.y }, color);
-}
-
 static ImVec2 toImVec(const glm::vec2 vec) {
     return ImVec2(vec.x, vec.y);
 }
@@ -496,7 +185,7 @@ static void LoadAtlas(std::span<const uint8_t> data) {
     int width, height, n;
     auto* dat = stbi_load_from_memory(data.data(), data.size(), &width, &height, &n, 4);
     if(dat == nullptr) {
-        throw std::runtime_error("invalid texture atlas format");
+        throw std::runtime_error("failed to load texture atlas");
     }
 
     atlas = std::make_unique<Texture>();
@@ -526,80 +215,88 @@ static void LoadAtlas(std::span<const uint8_t> data) {
 
 static bool load_game(const std::string& path) {
     if(!std::filesystem::exists(path)) {
-        ErrorDialog.push("File not found");
         return false;
     }
     rawData = readFile(path.c_str());
 
-    auto sections = getSegmentOffsets(rawData);
+    try {
+        auto sections = getSegmentOffsets(rawData);
 
-    assert(sections.data.size() >= sizeof(asset_entry) * 676);
-    auto assets = std::span((asset_entry*)sections.data.data(), 676);
+        assert(sections.data.size() >= sizeof(asset_entry) * 676);
+        auto assets = std::span((asset_entry*)sections.data.data(), 676);
 
-    std::vector<uint8_t> decryptBuffer;
+        std::vector<uint8_t> decryptBuffer;
 
-    auto get_asset = [&](int id) {
-        assert(id >= 0 && id < 676);
-        auto& asset = assets[id];
-        assert(sections.rdata.size() >= asset.ptr - sections.rdata_pointer_offset + asset.length);
-        auto dat = sections.rdata.subspan(asset.ptr - sections.rdata_pointer_offset, asset.length);
+        auto get_asset = [&](int id) {
+            assert(id >= 0 && id < 676);
+            auto& asset = assets[id];
+            assert(sections.rdata.size() >= asset.ptr - sections.rdata_pointer_offset + asset.length);
+            auto dat = sections.rdata.subspan(asset.ptr - sections.rdata_pointer_offset, asset.length);
 
-        if(tryDecrypt(asset, dat, decryptBuffer)) {
-            return std::span(decryptBuffer);
+            if(tryDecrypt(asset, dat, decryptBuffer)) {
+                return std::span(decryptBuffer);
+            }
+            return dat;
+        };
+
+        LoadAtlas(get_asset(255));
+
+        if(bg_tex == nullptr) {
+            bg_tex = std::make_unique<Texture>();
         }
-        return dat;
-    };
 
-    LoadAtlas(get_asset(255));
+        bg_tex->Bind();
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 320 * 4, 180 * 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
-    bg_tex = std::make_unique<Texture>();
-    glBindTexture(GL_TEXTURE_2D_ARRAY, bg_tex->id);
-    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGB, 320, 180, 19, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 
-    bg_tex->LoadSubImage(1 - 1, get_asset(14));
-    bg_tex->LoadSubImage(2 - 1, get_asset(22));
-    bg_tex->LoadSubImage(3 - 1, get_asset(22));
-    bg_tex->LoadSubImage(4 - 1, get_asset(19));
-    bg_tex->LoadSubImage(5 - 1, get_asset(19));
-    bg_tex->LoadSubImage(6 - 1, get_asset(15));
-    bg_tex->LoadSubImage(7 - 1, get_asset(13));
-    bg_tex->LoadSubImage(8 - 1, get_asset(13));
-    bg_tex->LoadSubImage(9 - 1, get_asset(16));
-    bg_tex->LoadSubImage(10 - 1, get_asset(17));
-    bg_tex->LoadSubImage(11 - 1, get_asset(16));
-    bg_tex->LoadSubImage(12 - 1, get_asset(26));
-    bg_tex->LoadSubImage(13 - 1, get_asset(11));
-    bg_tex->LoadSubImage(14 - 1, get_asset(12));
-    bg_tex->LoadSubImage(15 - 1, get_asset(20));
-    bg_tex->LoadSubImage(16 - 1, get_asset(18));
-    bg_tex->LoadSubImage(17 - 1, get_asset(23));
-    bg_tex->LoadSubImage(18 - 1, get_asset(24));
-    bg_tex->LoadSubImage(19 - 1, get_asset(21));
+        bg_tex->LoadSubImage(320 * 0, 180 * 0, get_asset(11)); // 13
+        bg_tex->LoadSubImage(320 * 1, 180 * 0, get_asset(12)); // 14
+        bg_tex->LoadSubImage(320 * 2, 180 * 0, get_asset(13)); // 7, 8
+        bg_tex->LoadSubImage(320 * 3, 180 * 0, get_asset(14)); // 1
 
-    for(size_t i = 0; i < 5; i++) {
-        maps[i] = Map(get_asset(mapIds[i]));
+        bg_tex->LoadSubImage(320 * 0, 180 * 1, get_asset(15)); // 6
+        bg_tex->LoadSubImage(320 * 1, 180 * 1, get_asset(16)); // 9, 11
+        bg_tex->LoadSubImage(320 * 2, 180 * 1, get_asset(17)); // 10
+        bg_tex->LoadSubImage(320 * 3, 180 * 1, get_asset(18)); // 16
+
+        bg_tex->LoadSubImage(320 * 0, 180 * 2, get_asset(19)); // 4, 5
+        bg_tex->LoadSubImage(320 * 1, 180 * 2, get_asset(20)); // 15
+        bg_tex->LoadSubImage(320 * 2, 180 * 2, get_asset(21)); // 19
+        bg_tex->LoadSubImage(320 * 3, 180 * 2, get_asset(22)); // 2, 3
+
+        bg_tex->LoadSubImage(320 * 0, 180 * 3, get_asset(23)); // 17
+        bg_tex->LoadSubImage(320 * 1, 180 * 3, get_asset(24)); // 18
+        bg_tex->LoadSubImage(320 * 2, 180 * 3, get_asset(26)); // 12
+
+        for(size_t i = 0; i < 5; i++) {
+            maps[i] = Map(get_asset(mapIds[i]));
+        }
+
+        for(auto el : spriteMapping) {
+            sprites[el.tile_id] = parse_sprite(get_asset(el.asset_id));
+        }
+
+        uvs = parse_uvs(get_asset(254));
+
+        updateRender();
+        return true;
+    } catch(std::exception& e) {
+        ErrorDialog.push(e.what());
     }
 
-    for(auto el : spriteMapping) {
-        sprites[el.tile_id] = parse_sprite(get_asset(el.asset_id));
-    }
-
-    uvs = parse_uvs(get_asset(254));
-
-    updateRender();
-
-    ImGui::CloseCurrentPopup();
-    return true;
+    return false;
 }
 
 static void load_game_dialog() {
+    static std::string lastPath = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Animal Well";
     std::string path;
-    auto result = NFD::OpenDialog({ { "Game", { ".exe" } } }, "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Animal Well", path, window);
+    auto result = NFD::OpenDialog({{"Game", {"exe"}}}, lastPath.c_str(), path, window);
     if(result == NFD::Result::Error) {
         ErrorDialog.push(NFD::GetError());
     } else if(result == NFD::Result::Okay) {
+        lastPath = path;
         load_game(path);
     }
 }
@@ -608,6 +305,7 @@ static void DrawUvFlags(uv_data& uv) {
     if(ImGui::BeginTable("uv_flags_table", 2)) {
         uint32_t flags = uv.flags;
 
+        // clang-format off
         ImGui::TableNextRow();
         ImGui::TableNextColumn(); ImGui::CheckboxFlags("Collides left", &flags, 1 << 0); // correct
         ImGui::TableNextColumn(); ImGui::CheckboxFlags("Hidden", &flags, 1 << 10);
@@ -621,7 +319,7 @@ static void DrawUvFlags(uv_data& uv) {
         ImGui::TableNextColumn(); ImGui::CheckboxFlags("obscures", &flags, 1 << 6);
 
         ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Collides down", &flags, 1 << 3);   // correct
+        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Collides down", &flags, 1 << 3); // correct
         ImGui::TableNextColumn(); ImGui::CheckboxFlags("Contiguous", &flags, 1 << 7); // correct
 
         ImGui::TableNextRow();
@@ -633,8 +331,9 @@ static void DrawUvFlags(uv_data& uv) {
         ImGui::TableNextColumn(); ImGui::CheckboxFlags("Dirt", &flags, 1 << 11);
 
         ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Has Normals", &flags, 1 << 12);  // correct
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("UV Light", &flags, 1 << 13);     // correct
+        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Has Normals", &flags, 1 << 12); // correct
+        ImGui::TableNextColumn(); ImGui::CheckboxFlags("UV Light", &flags, 1 << 13); // correct
+        // clang-format on
 
         if(flags != uv.flags) {
             uv.flags = flags;
@@ -652,8 +351,7 @@ class {
     int selected_composition = 0;
     int selected_sprite = 0;
 
-   public:
-
+  public:
     void draw() {
         if(!ImGui::Begin("Sprite Viewer")) {
             ImGui::End();
@@ -753,7 +451,7 @@ class {
 } SpriteViewer;
 
 class {
-   public:
+  public:
     int selected_tile;
 
     void draw() {
@@ -804,7 +502,7 @@ class {
     ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable;
     bool show_on_map;
 
-   public:
+  public:
     void draw() {
         auto& map = maps[selectedMap];
 
@@ -878,7 +576,8 @@ class {
 
                 auto uv = uvs[tile->tile_id];
 
-                DrawRect(selectionVerts, glm::vec2(result.x * 8, result.y * 8),  glm::vec2(uv.size), {1, 0, 0, 0.8f}, 8 / gScale);
+                auto p = glm::vec2(result) * 8.0f;
+                overlay->AddRect(p, p + glm::vec2(uv.size), IM_COL32(255, 0, 0, 204), 8 / gScale);
             }
         }
     }
@@ -888,7 +587,7 @@ class {
 class {
     std::vector<std::tuple<int, glm::vec2, glm::vec2>> tiles_;
 
-   public:
+  public:
     void draw() {
         if(!ImGui::Begin("Tile List")) {
             ImGui::End();
@@ -913,12 +612,12 @@ class {
         auto pad = ImGui::GetStyle().FramePadding.x;
 
         for(const auto& [id, pos, size] : tiles_) {
-            ImGui::SetItemTooltip("%i", id);
             ImGui::PushID(id);
             if(ImGui::ImageButton((ImTextureID)atlas->id.value, ImVec2(32, 32), toImVec(pos), toImVec(pos + size))) {
                 TileViewer.selected_tile = id;
                 TileViewer.focus();
             }
+            ImGui::SetItemTooltip("%i", id);
             ImGui::PopID();
             ImGui::SameLine();
 
@@ -933,11 +632,13 @@ class {
 } TileList;
 
 static void dump_assets() {
+    static std::string lastPath = std::filesystem::current_path().string();
     std::string path;
-    auto result = NFD::PickFolder(std::filesystem::current_path().string().c_str(), path, window);
+    auto result = NFD::PickFolder(lastPath.c_str(), path, window);
     if(result != NFD::Result::Okay) {
         return;
     }
+    lastPath = path;
 
     try {
         std::filesystem::create_directories(path);
@@ -1004,8 +705,8 @@ static void randomize() {
 
     //  16 = save_point
     //  39 = telephone
-    target.insert( 40); // = key
-    target.insert( 41); // = match
+    target.insert(40); // = key
+    target.insert(41); // = match
     //  90 = egg
     target.insert(109); // = lamp
     target.insert(149); // = stamps
@@ -1068,8 +769,9 @@ static void randomize() {
 }
 
 static void export_exe(bool patch_renderdoc) {
+    static std::string lastPath = std::filesystem::current_path().string();
     std::string path;
-    auto result = NFD::SaveDialog({ { "Game", {".exe"} } }, std::filesystem::current_path().string().c_str(), path, window);
+    auto result = NFD::SaveDialog({{"Game", {"exe"}}}, lastPath.c_str(), path, window);
 
     if(result == NFD::Result::Error) {
         ErrorDialog.push(NFD::GetError());
@@ -1078,6 +780,7 @@ static void export_exe(bool patch_renderdoc) {
     if(result == NFD::Result::Cancel) {
         return;
     }
+    lastPath = path;
 
     try {
         auto out = rawData;
@@ -1140,13 +843,12 @@ static void export_exe(bool patch_renderdoc) {
         }
 
         if(!error) {
-            std::ofstream file("Animal Well.exe", std::ios::binary);
+            std::ofstream file(path, std::ios::binary);
             file.write(out.data(), out.size());
         }
     } catch(std::exception& e) {
         ErrorDialog.push(e.what());
     }
-
 }
 
 // Tips: Use with ImGuiDockNodeFlags_PassthruCentralNode!
@@ -1196,34 +898,38 @@ ImGuiID DockSpaceOverViewport() {
             ImGui::Separator();
 
             if(ImGui::MenuItem("Load Map")) {
+                static std::string lastPath = std::filesystem::current_path().string();
                 std::string path;
-                auto result = NFD::OpenDialog({ {"Map", {".map"}} }, std::filesystem::current_path().string().c_str(), path, window);
+                auto result = NFD::OpenDialog({{"Map", {"map"}}}, lastPath.c_str(), path, window);
 
                 if(result == NFD::Result::Error) {
                     ErrorDialog.push(NFD::GetError());
                 } else if(result == NFD::Result::Okay) {
+                    lastPath = path;
                     try {
                         auto data = readFile(path.c_str());
                         auto map = Map(std::span((uint8_t*)data.data(), data.size()));
 
-                        if(map.coordinate_map == maps[selectedMap].coordinate_map) {
-                            maps[selectedMap] = map;
-                            updateRender();
-                        } else {
-                            ErrorDialog.push("Map structure differs from currently loaded map.\nTry loading from a different slot.");
+                        if(map.coordinate_map != maps[selectedMap].coordinate_map) {
+                            ErrorDialog.push("Warning map structure differs from previously loaded map.\nMight break things so be careful.");
                         }
+
+                        maps[selectedMap] = map;
+                        updateRender();
                     } catch(std::exception& e) {
                         ErrorDialog.push(e.what());
                     }
                 }
             }
             if(ImGui::MenuItem("Export Map")) {
+                static std::string lastPath = std::filesystem::current_path().string();
                 std::string path;
-                auto result = NFD::SaveDialog({ { "Map", {".map" }} }, std::filesystem::current_path().string().c_str(), path, window);
+                auto result = NFD::SaveDialog({{"Map", {"map"}}}, lastPath.c_str(), path, window);
 
                 if(result == NFD::Result::Error) {
                     ErrorDialog.push(NFD::GetError());
                 } else if(result == NFD::Result::Okay) {
+                    lastPath = path;
                     auto data = maps[selectedMap].save();
                     try {
                         std::ofstream file(path, std::ios::binary);
@@ -1239,7 +945,6 @@ ImGuiID DockSpaceOverViewport() {
         }
 
         if(ImGui::BeginMenu("Display")) {
-            static const char* mapNames[5] = { "Overworld", "Space", "Bunny temple", "Time Capsule", "CE temple" };
             if(ImGui::Combo("Map", &selectedMap, mapNames, 5)) {
                 updateRender();
             }
@@ -1251,6 +956,8 @@ ImGuiID DockSpaceOverViewport() {
             ImGui::Checkbox("Background Texture", &show_bg_tex);
             ImGui::ColorEdit4("bg Texture color", &bg_tex_color.r);
             ImGui::Checkbox("Apply lighting", &do_lighting);
+            ImGui::Checkbox("Show Room Grid", &room_grid);
+            ImGui::Checkbox("Show Water Level", &show_water);
 
             ImGui::EndMenu();
         }
@@ -1313,7 +1020,7 @@ static void DrawPreviewWindow() {
     auto& io = ImGui::GetIO();
     // ImGui::Text("fps %f", ImGui::GetIO().Framerate);
 
-    static const char* modes[] = { "Select", "Place" };
+    static const char* modes[] = {"Select", "Place"};
     static int mode = 0;
     ImGui::Combo("Mode", &mode, modes, sizeof(modes) / sizeof(char*));
 
@@ -1355,8 +1062,7 @@ static void DrawPreviewWindow() {
             ImGui::InputScalar("water level", ImGuiDataType_U8, &room->waterLevel);
             uint8_t bg_min = 0, bg_max = 18;
             if(ImGui::SliderScalar("background id", ImGuiDataType_U8, &room->bgId, &bg_min, &bg_max)) {
-                vertecies_bg_tex = renderBgs(maps[selectedMap]);
-                VBO_bg_tex->BufferData(vertecies_bg_tex.data(), vertecies_bg_tex.size() * sizeof(float) * 5);
+                renderBgs(maps[selectedMap], *bg_text);
             }
 
             ImGui::InputScalar("pallet_index", ImGuiDataType_U8, &room->pallet_index);
@@ -1380,7 +1086,8 @@ static void DrawPreviewWindow() {
             }
 
             ImGui::SeparatorText("Room Tile Data");
-            ImGui::Text("position %i %i %s", tp.x, tp.y, tile_layer == 0 ? "Foreground" : tile_layer == 1 ? "Background" : "N/A");
+            ImGui::Text("position %i %i %s", tp.x, tp.y, tile_layer == 0 ? "Foreground" : tile_layer == 1 ? "Background"
+                                                                                                          : "N/A");
             ImGui::Text("id %i", tile.tile_id);
             ImGui::Text("param %i", tile.param);
 
@@ -1388,7 +1095,7 @@ static void DrawPreviewWindow() {
                 int flags = tile.flags;
 
                 if(tile_layer == 2) ImGui::BeginDisabled();
-
+                // clang-format off
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::CheckboxFlags("horizontal_mirror", &flags, 1);
                 ImGui::TableNextColumn(); ImGui::CheckboxFlags("vertical_mirror", &flags, 2);
@@ -1396,6 +1103,7 @@ static void DrawPreviewWindow() {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::CheckboxFlags("rotate_90", &flags, 4);
                 ImGui::TableNextColumn(); ImGui::CheckboxFlags("rotate_180", &flags, 8);
+                // clang-format on
 
                 if(tile_layer == 2) ImGui::EndDisabled();
 
@@ -1453,19 +1161,19 @@ static void DrawPreviewWindow() {
                     auto& layer = sprite.layers[j];
                     if(layer.is_normals1 || layer.is_normals2 || !layer.is_visible) continue;
 
-                    DrawRect(selectionVerts, ap, glm::vec2(subsprite.size), { 1, 1, 1, 1 }, 0.5f);
+                    overlay->AddRect(ap, end, IM_COL32_WHITE, 0.5f);
                     // ImGui::Image((ImTextureID)atlas->id.value, toImVec(size), )
                 }
 
-                DrawRect(selectionVerts, pos, bb_max - pos, { 1, 1, 1, 0.8 }, 1);
+                overlay->AddRect(pos, bb_max, IM_COL32(255, 255, 255, 204), 1);
             } else {
                 if(tile.tile_id == 0) {
-                    DrawRect(selectionVerts, pos, glm::vec2(8), { 1, 1, 1, 1 }, 1);
+                    overlay->AddRect(pos, pos + glm::vec2(8), IM_COL32_WHITE, 1);
                 } else {
-                    DrawRect(selectionVerts, pos, glm::vec2(uv.size), { 1, 1, 1, 1 }, 1);
+                    overlay->AddRect(pos, pos + glm::vec2(uv.size), IM_COL32_WHITE, 1);
                 }
             }
-            DrawRect(selectionVerts, room_pos * room_size * 8, glm::ivec2(40, 22) * 8, {1, 1, 1, 0.5}, 1);
+            if(!room_grid) overlay->AddRect(room_pos * room_size * 8, room_pos * room_size * 8 + glm::ivec2(40, 22) * 8, IM_COL32(255, 255, 255, 127), 1);
         }
     } else if(mode == 1) {
         static MapTile placing;
@@ -1485,9 +1193,9 @@ static void DrawPreviewWindow() {
                 if(show_fg && tile.tile_id != 0) {
                     placing = tile;
                     background = false;
-                } else if(show_bg) {
+                } else {
                     tile = room->tiles[1][tp.y][tp.x];
-                    if(tile.tile_id != 0) {
+                    if(show_bg && tile.tile_id != 0) {
                         placing = tile;
                         background = true;
                     } else {
@@ -1514,7 +1222,7 @@ static void DrawPreviewWindow() {
 
         if(ImGui::BeginTable("tile_flags_table", 2)) {
             int flags = placing.flags;
-
+            // clang-format off
             ImGui::TableNextRow();
             ImGui::TableNextColumn(); ImGui::CheckboxFlags("Horizontal mirror", &flags, 1);
             ImGui::TableNextColumn(); ImGui::CheckboxFlags("Vertical mirror", &flags, 2);
@@ -1522,6 +1230,7 @@ static void DrawPreviewWindow() {
             ImGui::TableNextRow();
             ImGui::TableNextColumn(); ImGui::CheckboxFlags("Rotate 90", &flags, 4);
             ImGui::TableNextColumn(); ImGui::CheckboxFlags("Rotate 180", &flags, 8);
+            // clang-format on
 
             placing.flags = flags;
 
@@ -1538,19 +1247,55 @@ static void DrawPreviewWindow() {
         ImGui::Image((ImTextureID)atlas->id.value, toImVec(size * 8.0f), toImVec(pos / atlas_size), toImVec((pos + size) / atlas_size));
 
         if(room != nullptr) {
-            DrawRect(selectionVerts, glm::vec2(mouse_world_pos) * 8.0f, glm::vec2(8), { 1, 1, 1, 1 }, 1);
-            DrawRect(selectionVerts, room_pos * room_size * 8, glm::ivec2(40, 22) * 8, { 1, 1, 1, 0.5 }, 1);
+            overlay->AddRect(mouse_world_pos * 8, mouse_world_pos * 8 + 8);
+            if(!room_grid) overlay->AddRect(room_pos * room_size * 8, room_pos * room_size * 8 + glm::ivec2(40, 22) * 8, IM_COL32(255, 255, 255, 127), 1);
         }
     }
 
     ImGui::End();
 }
 
+static void draw_water_level() {
+    if(!show_water) {
+        return;
+    }
+
+    const Map& map = maps[selectedMap];
+
+    for(const Room& room : map.rooms) {
+        if(room.waterLevel >= 176) {
+            continue;
+        }
+
+        auto bottom_left = glm::vec2 {room.x * 40 * 8, (room.y + 1) * 22 * 8};
+        auto size = glm::vec2 {40 * 8, room.waterLevel - 176};
+
+        overlay->AddRectFilled(bottom_left, bottom_left + size, {}, {}, IM_COL32(0, 0, 255, 76));
+    }
+}
+
+static void draw_room_grid() {
+    if(!room_grid) {
+        return;
+    }
+
+    const auto& map = maps[selectedMap];
+
+    for(size_t i = 0; i <= map.size.x; i++) {
+        auto x = (map.offset.x + i) * 40 * 8;
+        overlay->AddLine({x, map.offset.y * 22 * 8}, {x, (map.offset.y + map.size.y) * 22 * 8}, IM_COL32(255, 255, 255, 191), 1 / gScale);
+    }
+    for(size_t i = 0; i <= map.size.y; i++) {
+        auto y = (map.offset.y + i) * 22 * 8;
+        overlay->AddLine({map.offset.x * 40 * 8, y}, {(map.offset.x + map.size.x) * 40 * 8, y}, IM_COL32(255, 255, 255, 191), 1 / gScale);
+    }
+}
+
 // Main code
 int runViewer() {
 #pragma region glfw/opengl setup
     glfwSetErrorCallback(glfw_error_callback);
-    if (!glfwInit())
+    if(!glfwInit())
         return 1;
 
     // GL 3.0 + GLSL 130
@@ -1562,13 +1307,13 @@ int runViewer() {
 
     // Create window with graphics context
     window = glfwCreateWindow(1280, 720, "Animal Well map viewer", nullptr, nullptr);
-    if (window == nullptr)
+    if(window == nullptr)
         return 1;
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);  // Enable vsync
+    glfwSwapInterval(1); // Enable vsync
 
     int version = gladLoadGL(glfwGetProcAddress);
-    if (version == 0) {
+    if(version == 0) {
         printf("Failed to initialize OpenGL context\n");
         return -1;
     }
@@ -1602,7 +1347,7 @@ int runViewer() {
 
     // When viewports are enabled we tweak WindowRounding/WindowBg so platform windows can look identical to regular ones.
     ImGuiStyle& style = ImGui::GetStyle();
-    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+    if(io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
         style.WindowRounding = 0.0f;
         style.Colors[ImGuiCol_WindowBg].w = 1.0f;
     }
@@ -1633,74 +1378,38 @@ int runViewer() {
 #pragma endregion
 
 #pragma region opgenl buffer setup
+
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    ShaderProgram tile_shader("shaders/tile.vs", "shaders/tile.fs");
-    ShaderProgram bg_shader("shaders/bg.vs", "shaders/bg.fs");
-    ShaderProgram light_shader("shaders/light.vs", "shaders/light.fs");
+    ShaderProgram tile_shader("src/shaders/tile.vs", "src/shaders/tile.fs");
+    ShaderProgram bg_shader("src/shaders/bg.vs", "src/shaders/bg.fs");
+    ShaderProgram light_shader("src/shaders/light.vs", "src/shaders/light.fs");
+    ShaderProgram merge_shader("src/shaders/merge.vs", "src/shaders/merge.fs");
 
-    ShaderProgram merge_shader("shaders/merge.vs", "shaders/merge.fs");
     merge_shader.Use();
     merge_shader.setInt("tiles", 0);
     merge_shader.setInt("lights", 1);
 
-    VAO VAO_fg{};
-    VBO_fg = std::make_unique<VBO>( GL_ARRAY_BUFFER, GL_STATIC_DRAW );
-    VAO_fg.Bind();
-    VBO_fg->Bind();
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, nullptr);
-
-    VAO VAO_bg{};
-    VBO_bg = std::make_unique<VBO>( GL_ARRAY_BUFFER, GL_STATIC_DRAW );
-    VAO_bg.Bind();
-    VBO_bg->Bind();
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, nullptr);
-
-    VAO VAO_bg_tex{};
-    VBO_bg_tex = std::make_unique<VBO>( GL_ARRAY_BUFFER, GL_STATIC_DRAW );
-    VAO_bg_tex.Bind();
-    VBO_bg_tex->Bind();
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(2 * sizeof(float)));
-
-    VAO VAO_light{};
-    VBO_light = std::make_unique<VBO>( GL_ARRAY_BUFFER, GL_STATIC_DRAW );
-    VAO_light.Bind();
-    VBO_light->Bind();
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(2 * sizeof(float)));
-
+    fg_tiles = std::make_unique<Mesh>();
+    bg_tiles = std::make_unique<Mesh>();
+    bg_text = std::make_unique<Mesh>();
+    lights = std::make_unique<Mesh>();
+    overlay = std::make_unique<Mesh>();
     Textured_Framebuffer light_fb(1280, 720, GL_RGBA16F);
     Textured_Framebuffer tile_fb(1280, 720, GL_RGBA16F);
 
     framebuffers.push_back(&light_fb);
     framebuffers.push_back(&tile_fb);
 
-    VAO VAO_selction{};
-    VBO_selection = std::make_unique<VBO>(GL_ARRAY_BUFFER, GL_STATIC_DRAW);
-    VAO_selction.Bind();
-    VBO_selection->Bind();
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
-
 #pragma endregion
 
     if(!load_game("C:/Program Files (x86)/Steam/steamapps/common/Animal Well/Animal Well.exe")) {
         load_game("./Animal Well.exe");
     }
-    ErrorDialog.clear();
 
     // Main loop
-    while (!glfwWindowShouldClose(window)) {
+    while(!glfwWindowShouldClose(window)) {
         // Poll and handle events (inputs, window resize, etc.)
         // You can read the io.WantCaptureMouse, io.WantCaptureKeyboard flags to tell if dear imgui wants to use your inputs.
         // - When io.WantCaptureMouse is true, do not dispatch mouse input data to your main application, or clear/overwrite your copy of the mouse data.
@@ -1713,7 +1422,7 @@ int runViewer() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        selectionVerts.clear();
+        overlay->clear();
 
         MVP = projection * view;
 
@@ -1729,6 +1438,9 @@ int runViewer() {
             SpriteViewer.draw();
             DrawPreviewWindow();
 
+            draw_room_grid();
+            draw_water_level();
+
             // 1. light pass
             if(do_lighting) {
                 glClearColor(0.0, 0.0, 0.0, 1.0);
@@ -1737,8 +1449,8 @@ int runViewer() {
 
                 light_shader.Use();
                 light_shader.setMat4("MVP", MVP);
-                VAO_light.Bind();
-                glDrawArrays(GL_TRIANGLES, 0, vertecies_light.size());
+
+                lights->Draw();
             } else {
                 glClearColor(1.0, 1.0, 1.0, 1.0);
                 light_fb.Bind();
@@ -1758,9 +1470,7 @@ int runViewer() {
 
                 glActiveTexture(GL_TEXTURE0);
                 bg_tex->Bind();
-
-                VAO_bg_tex.Bind();
-                glDrawArrays(GL_TRIANGLES, 0, vertecies_bg_tex.size());
+                bg_text->Draw();
             }
 
             tile_shader.Use();
@@ -1769,15 +1479,13 @@ int runViewer() {
             glActiveTexture(GL_TEXTURE0);
             atlas->Bind();
 
-            if (show_bg) {
+            if(show_bg) {
                 tile_shader.setVec4("color", bg_color);
-                VAO_bg.Bind();
-                glDrawArrays(GL_TRIANGLES, 0, vertecies_bg.size());
+                bg_tiles->Draw();
             }
-            if (show_fg) {
+            if(show_fg) {
                 tile_shader.setVec4("color", fg_color);
-                VAO_fg.Bind();
-                glDrawArrays(GL_TRIANGLES, 0, vertecies_fg.size());
+                fg_tiles->Draw();
             }
 
             // 3. final merge pass
@@ -1796,9 +1504,9 @@ int runViewer() {
             // 4. draw selection vertices over that
             light_shader.Use();
             light_shader.setMat4("MVP", MVP);
-            VAO_selction.Bind();
-            VBO_selection->BufferData(selectionVerts.data(), selectionVerts.size() * sizeof(float) * 6);
-            glDrawArrays(GL_TRIANGLES, 0, selectionVerts.size());
+
+            overlay->Buffer();
+            overlay->Draw();
         } else {
             glBindFramebuffer(GL_FRAMEBUFFER, 0);
             glClearColor(0.45f, 0.55f, 0.60f, 1.00f);
@@ -1812,7 +1520,7 @@ int runViewer() {
         // Update and Render additional Platform Windows
         // (Platform functions may change the current OpenGL context, so we save/restore it to make it easier to paste this code elsewhere.
         //  For this specific demo app we could also call glfwMakeContextCurrent(window) directly)
-        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+        if(io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
             GLFWwindow* backup_current_context = glfwGetCurrentContext();
             ImGui::UpdatePlatformWindows();
             ImGui::RenderPlatformWindowsDefault();

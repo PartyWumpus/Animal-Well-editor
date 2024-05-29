@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <span>
 #include <vector>
 
@@ -20,12 +19,11 @@ enum class AssetType : uint8_t {
     Encrypted_Ogg = 67
 };
 
-// starts at 0x020E9A00 or 1420eb000 in ghidra
 struct asset_entry {
     AssetType type;
     uint8_t unknown1[7];
 
-    uint64_t ptr;  // offset by 0x140001200
+    uint64_t ptr; // offset by 0x140001200
     uint32_t length;
 
     uint32_t unknown2;
@@ -34,11 +32,6 @@ struct asset_entry {
     uint8_t unknown4[16];
 };
 static_assert(sizeof(asset_entry) == 0x30);
-
-struct OutAsset {
-    asset_entry info;
-    std::vector<uint8_t> data;
-};
 
 std::vector<char> readFile(const char* path);
 

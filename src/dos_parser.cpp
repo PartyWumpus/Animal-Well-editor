@@ -8,7 +8,7 @@
 // mostly adapted from the ImHex PE pattern made by WerWolv
 
 struct DOSHeader {
-    char signature[2];
+    uint16_t signature;
     uint16_t extraPageSize;
     uint16_t numberOfPages;
     uint16_t relocations;
@@ -76,7 +76,7 @@ struct Characteristics {
     bool symbolsStripped : 1;
     bool aggressivelyTrimWorkingSet : 1;
     bool largeAddressAware : 1;
-    bool : 1;  // padding
+    bool : 1; // padding
     bool bytesReversedLo : 1;
     bool machine32Bit : 1;
     bool debugInfoStripped : 1;
@@ -187,7 +187,7 @@ struct OptionalHeader {
 };
 
 struct COFFHeader {
-    char signature[4];
+    uint32_t signature;
     ArchitectureType architecture;
     uint16_t numberOfSections;
     uint32_t timeDateStamp;
@@ -246,21 +246,29 @@ SegmentData getSegmentOffsets(std::span<char> data) {
     auto ptr = (uint8_t*)data.data();
 
     auto dos_header = (DOSHeader*)ptr;
+    if(dos_header->signature != 0x5A4D) { // 'ZM'
+        throw std::runtime_error("invalid dos header");
+    }
     auto coff_header_ptr = (COFFHeader*)(ptr + dos_header->coffHeaderPointer);
+    if(coff_header_ptr->signature != 0x00004550) { // 'PE\0\0'
+        throw std::runtime_error("invalid coff_header");
+    }
     auto coff_optional_header = (OptionalHeader*)(ptr + dos_header->coffHeaderPointer + sizeof(COFFHeader));
+    if(coff_optional_header->magic != PEFormat::PE32Plus) {
+        throw std::runtime_error("invalid coff_optional_header");
+    }
     auto section_ptr = (SectionHeader*)(ptr + dos_header->coffHeaderPointer + sizeof(COFFHeader) + coff_header_ptr->sizeOfOptionalHeader);
-    // assert(coff_header_ptr->optionalHeader.magic == PEFormat::PE32Plus);
     auto image_base = coff_optional_header->imageBase;
 
     std::span<uint8_t> dat;
     std::span<uint8_t> rdata;
     uint64_t rdata_offset = -1;
 
-    for (size_t i = 0; i < coff_header_ptr->numberOfSections; i++) {
+    for(size_t i = 0; i < coff_header_ptr->numberOfSections; i++) {
         auto& section = section_ptr[i];
-        if (std::strcmp(section.name, ".data") == 0) {
+        if(std::strcmp(section.name, ".data") == 0) {
             dat = std::span(ptr + section.ptrRawData, section.sizeOfRawData);
-        } else if (std::strcmp(section.name, ".rdata") == 0) {
+        } else if(std::strcmp(section.name, ".rdata") == 0) {
             rdata = std::span(ptr + section.ptrRawData, section.sizeOfRawData);
             rdata_offset = section.rva + image_base;
         }
@@ -269,6 +277,6 @@ SegmentData getSegmentOffsets(std::span<char> data) {
     return {
         dat,
         rdata_offset,
-        rdata
+        rdata,
     };
 }
