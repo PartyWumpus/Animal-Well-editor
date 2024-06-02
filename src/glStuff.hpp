@@ -9,7 +9,7 @@
 #include <stb_image.h>
 
 #include <cmrc/cmrc.hpp>
-CMRC_DECLARE(shaders);
+CMRC_DECLARE(resources);
 
 #include "windows/errors.hpp"
 
@@ -126,14 +126,14 @@ struct Texture {
     }
 
     void LoadSubImage(int x, int y, std::span<const uint8_t> data) {
-        int width, height, n;
-        auto* dat = stbi_load_from_memory(data.data(), data.size(), &width, &height, &n, 4);
+        int w, h, n;
+        auto* dat = stbi_load_from_memory(data.data(), data.size(), &w, &h, &n, 4);
         if(dat == nullptr) {
             throw std::runtime_error("failed to load texture");
         }
 
         glBindTexture(GL_TEXTURE_2D, id);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, width, height, GL_RGBA, GL_UNSIGNED_BYTE, dat);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, dat);
 
         stbi_image_free(dat);
     }
@@ -157,13 +157,12 @@ struct Framebuffer {
 struct Textured_Framebuffer {
     Framebuffer fb;
     Texture tex;
-    GLint internal_format;
 
-    Textured_Framebuffer(int width, int height, GLint internal_format) : internal_format(internal_format) {
+    Textured_Framebuffer(int width, int height) {
         fb.Bind();
         tex.Bind();
 
-        glTexImage2D(GL_TEXTURE_2D, 0, internal_format, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -176,7 +175,7 @@ struct Textured_Framebuffer {
             return;
 
         glBindTexture(GL_TEXTURE_2D, tex.id);
-        glTexImage2D(GL_TEXTURE_2D, 0, internal_format, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     }
 
     void Bind() {
@@ -188,7 +187,7 @@ struct ShaderProgram {
     Unique<GLuint> ID = 0;
 
     ShaderProgram(const std::string& vertexPath, const std::string& fragmentPath) {
-        auto fs = cmrc::shaders::get_filesystem();
+        auto fs = cmrc::resources::get_filesystem();
         if(!fs.exists(vertexPath)) {
             ErrorDialog.pushf("File not found \"%s\"", vertexPath.c_str());
             return;
@@ -281,6 +280,9 @@ struct Vertex {
     glm::vec2 position;
     glm::vec2 uv;
     uint32_t color;
+
+    Vertex(glm::vec2 position, glm::vec2 uv, uint32_t color) : position(position), uv(uv), color(color) {}
+    Vertex(glm::vec2 position, glm::vec2 uv) : position(position), uv(uv), color(IM_COL32_WHITE) {}
 };
 
 struct Mesh {
@@ -298,7 +300,7 @@ struct Mesh {
         glEnableVertexAttribArray(1);
         glVertexAttribPointer(1, 2, GL_FLOAT        , GL_FALSE, sizeof(Vertex), (void*)(2 * sizeof(float)));
         glEnableVertexAttribArray(2);
-        glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_FALSE, sizeof(Vertex), (void*)(4 * sizeof(float)));
+        glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), (void*)(4 * sizeof(float)));
     }
 
     void AddLine(glm::vec2 p1, glm::vec2 p2, uint32_t col = IM_COL32_WHITE, float thickness = 1) {
@@ -312,6 +314,23 @@ struct Mesh {
         data.emplace_back(glm::vec2(p1.x - d.y, p1.y + d.x), glm::vec2(), col); // bl
         data.emplace_back(glm::vec2(p2.x + d.y, p2.y - d.x), glm::vec2(), col); // tr
     }
+
+    void AddLineDashed(glm::vec2 p1, glm::vec2 p2, uint32_t col = IM_COL32_WHITE, float thickness = 1, float dashLength = 1) {
+        auto delta = p2 - p1;
+        auto length = glm::length(delta);
+        auto steps = (int)(length / dashLength);
+        delta = (delta / length) * dashLength / 2.0f;
+
+        for(int i = 0; i < steps; ++i) {
+            auto n = p1 + delta;
+            AddLine(p1, n, col, thickness);
+            p1 = n + delta;
+        }
+        // todo: draw last fractional segment
+        // not important for now since dashLength and length will always bee
+        // integers so there will never be any overlap
+    }
+
     void AddRect(glm::vec2 p_min, glm::vec2 p_max, uint32_t col = IM_COL32_WHITE, float thickness = 1) {
         AddLine(p_min, glm::vec2(p_max.x, p_min.y), col, thickness);
         AddLine(glm::vec2(p_max.x, p_min.y), p_max, col, thickness);
@@ -326,6 +345,13 @@ struct Mesh {
         data.emplace_back(glm::vec2(p_max.x, p_min.y), glm::vec2(uv_max.x, uv_min.y), col); // tr
         data.emplace_back(p_max, uv_max, col); // br
         data.emplace_back(glm::vec2(p_min.x, p_max.y), glm::vec2(uv_min.x, uv_max.y), col); // bl
+    }
+
+    void AddRectDashed(glm::vec2 p_min, glm::vec2 p_max, uint32_t col = IM_COL32_WHITE, float thickness = 1, float dashLength = 1) {
+        AddLineDashed(p_min, glm::vec2(p_max.x, p_min.y), col, thickness, dashLength);
+        AddLineDashed(glm::vec2(p_max.x, p_min.y), p_max, col, thickness, dashLength);
+        AddLineDashed(p_max, glm::vec2(p_min.x, p_max.y), col, thickness, dashLength);
+        AddLineDashed(glm::vec2(p_min.x, p_max.y), p_min, col, thickness, dashLength);
     }
 
     void Buffer() {
