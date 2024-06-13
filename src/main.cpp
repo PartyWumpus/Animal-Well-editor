@@ -1,13 +1,10 @@
 #include <algorithm>
-#include <array>
-#include <codecvt>
 #include <cstdio>
 #include <deque>
 #include <filesystem>
 #include <random>
 #include <set>
 #include <span>
-#include <unordered_map>
 
 #include "glStuff.hpp" // has to be included before glfw
 #include <GLFW/glfw3.h>
@@ -21,19 +18,19 @@
 #include <imgui_internal.h>
 #include <misc/cpp/imgui_stdlib.h>
 
-#include "structures/asset.hpp"
-#include "structures/map.hpp"
-#include "structures/sprite.hpp"
-#include "structures/tile.hpp"
+#include <nfd.h>
+#include <stb_image_write.h>
 
-#include "dos_parser.hpp"
+#include "game_data.hpp"
 #include "history.hpp"
 #include "map_slice.hpp"
 #include "rendering.hpp"
 
 #include "windows/errors.hpp"
-
-#include "nfd.h"
+#include "windows/search.hpp"
+#include "windows/sprite_viewer.hpp"
+#include "windows/tile_list.hpp"
+#include "windows/tile_viewer.hpp"
 
 // TODO:
 // reduce global state
@@ -57,19 +54,11 @@ glm::vec2 lastMousePos = glm::vec2(-1);
 
 glm::vec2 screenSize;
 
-std::vector<Textured_Framebuffer*> framebuffers;
 std::unique_ptr<Mesh> fg_tiles, bg_tiles, bg_text, overlay;
 
 int selectedMap = 0;
 
-std::vector<char> rawData;
-
-static const char* mapNames[5] = {"Overworld", "CE temple", "Space", "Bunny temple", "Time Capsule"};
-constexpr int mapIds[5] = {300, 157, 193, 52, 222};
-
-std::array<Map, 5> maps {};
-std::unordered_map<uint32_t, SpriteData> sprites;
-std::vector<uv_data> uvs;
+GameData game_data;
 
 std::unique_ptr<Texture> atlas;
 std::unique_ptr<Texture> bg_tex;
@@ -137,16 +126,12 @@ static void onResize(GLFWwindow* window, int width, int height) {
     screenSize = glm::vec2(width, height);
     glViewport(0, 0, width, height);
     projection = glm::ortho<float>(0, width, height, 0, 0.0f, 100.0f);
-
-    for(const auto fb : framebuffers) {
-        fb->resize(width, height);
-    }
 }
 
 static void updateRender() {
-    renderMap(maps[selectedMap], uvs, sprites, *fg_tiles, 0, accurate_vines);
-    renderMap(maps[selectedMap], uvs, sprites, *bg_tiles, 1, accurate_vines);
-    renderBgs(maps[selectedMap], *bg_text);
+    renderMap(game_data.maps[selectedMap], game_data.uvs, game_data.sprites, *fg_tiles, 0, accurate_vines);
+    renderMap(game_data.maps[selectedMap], game_data.uvs, game_data.sprites, *bg_tiles, 1, accurate_vines);
+    renderBgs(game_data.maps[selectedMap], *bg_text);
 }
 
 static void push_undo(std::unique_ptr<HistoryItem> item) {
@@ -187,7 +172,7 @@ class {
 
         orig_pos = {start_pos, selectLayer};
 
-        selection_buffer.copy(maps[selectedMap], orig_pos, _size);
+        selection_buffer.copy(game_data.maps[selectedMap], orig_pos, _size);
 
         push_undo(std::make_unique<AreaChange>(orig_pos, selection_buffer));
     }
@@ -207,19 +192,19 @@ class {
     }
     // move selection to different layer
     void change_layer(int from, int to) {
-        selection_buffer.swap(maps[selectedMap], glm::ivec3(start_pos, from)); // put original data back
-        selection_buffer.swap(maps[selectedMap], glm::ivec3(start_pos, to));   // store underlying
+        selection_buffer.swap(game_data.maps[selectedMap], glm::ivec3(start_pos, from)); // put original data back
+        selection_buffer.swap(game_data.maps[selectedMap], glm::ivec3(start_pos, to));   // store underlying
         updateRender();
     }
 
     void move(glm::ivec2 delta) {
         if(delta == glm::ivec2(0, 0)) return;
-        selection_buffer.swap(maps[selectedMap], glm::ivec3(start_pos, selectLayer)); // put original data back
+        selection_buffer.swap(game_data.maps[selectedMap], glm::ivec3(start_pos, selectLayer)); // put original data back
 
         // move to new pos
         start_pos += delta;
 
-        selection_buffer.swap(maps[selectedMap], glm::ivec3(start_pos, selectLayer)); // store underlying
+        selection_buffer.swap(game_data.maps[selectedMap], glm::ivec3(start_pos, selectLayer)); // store underlying
 
         updateRender();
     }
@@ -245,7 +230,7 @@ static void undo() {
     auto el = std::move(undo_buffer.back());
     undo_buffer.pop_back();
 
-    auto area = el->apply(maps[selectedMap]);
+    auto area = el->apply(game_data.maps[selectedMap]);
     updateRender();
 
     // select region that has been undone. only trigger change if actually moved
@@ -262,7 +247,7 @@ static void redo() {
     auto el = std::move(redo_buffer.back());
     redo_buffer.pop_back();
 
-    auto area = el->apply(maps[selectedMap]);
+    auto area = el->apply(game_data.maps[selectedMap]);
     updateRender();
 
     // selct region that has been redone. only trigger change if actually moved
@@ -284,9 +269,11 @@ static void LoadAtlas(std::span<const uint8_t> data) {
         throw std::runtime_error("failed to load texture atlas");
     }
 
-    atlas = std::make_unique<Texture>();
-    // chroma key cyan and replace with alpha
+    if(atlas == nullptr) {
+        atlas = std::make_unique<Texture>();
+    }
 
+    // chroma key cyan and replace with alpha
     auto vptr = (uint32_t*)dat;
     for(int i = 0; i < width * height; ++i) {
         if(vptr[i] == 0xFFFFFF00) {
@@ -313,28 +300,10 @@ static bool load_game(const std::string& path) {
     if(!std::filesystem::exists(path)) {
         return false;
     }
-    rawData = readFile(path.c_str());
 
     try {
-        auto sections = getSegmentOffsets(rawData);
-
-        assert(sections.data.size() >= sizeof(asset_entry) * 676);
-        auto assets = std::span((asset_entry*)sections.data.data(), 676);
-
-        std::vector<uint8_t> decryptBuffer;
-
-        auto get_asset = [&](int id) {
-            assert(id >= 0 && id < 676);
-            auto& asset = assets[id];
-            auto dat = sections.get_rdata_ptr(asset.ptr, asset.length);
-
-            if(tryDecrypt(asset, dat, decryptBuffer)) {
-                return std::span(decryptBuffer);
-            }
-            return dat;
-        };
-
-        LoadAtlas(get_asset(255));
+        game_data = GameData::load(path);
+        LoadAtlas(game_data.get_asset(255));
 
         if(bg_tex == nullptr) {
             bg_tex = std::make_unique<Texture>();
@@ -346,41 +315,31 @@ static bool load_game(const std::string& path) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 
-        bg_tex->LoadSubImage(320 * 0, 180 * 0, get_asset(11)); // 13
-        bg_tex->LoadSubImage(320 * 1, 180 * 0, get_asset(12)); // 14
-        bg_tex->LoadSubImage(320 * 2, 180 * 0, get_asset(13)); // 7, 8
-        bg_tex->LoadSubImage(320 * 3, 180 * 0, get_asset(14)); // 1
+        bg_tex->LoadSubImage(320 * 0, 180 * 0, game_data.get_asset(11)); // 13
+        bg_tex->LoadSubImage(320 * 1, 180 * 0, game_data.get_asset(12)); // 14
+        bg_tex->LoadSubImage(320 * 2, 180 * 0, game_data.get_asset(13)); // 7, 8
+        bg_tex->LoadSubImage(320 * 3, 180 * 0, game_data.get_asset(14)); // 1
 
-        bg_tex->LoadSubImage(320 * 0, 180 * 1, get_asset(15)); // 6
-        bg_tex->LoadSubImage(320 * 1, 180 * 1, get_asset(16)); // 9, 11
-        bg_tex->LoadSubImage(320 * 2, 180 * 1, get_asset(17)); // 10
-        bg_tex->LoadSubImage(320 * 3, 180 * 1, get_asset(18)); // 16
+        bg_tex->LoadSubImage(320 * 0, 180 * 1, game_data.get_asset(15)); // 6
+        bg_tex->LoadSubImage(320 * 1, 180 * 1, game_data.get_asset(16)); // 9, 11
+        bg_tex->LoadSubImage(320 * 2, 180 * 1, game_data.get_asset(17)); // 10
+        bg_tex->LoadSubImage(320 * 3, 180 * 1, game_data.get_asset(18)); // 16
 
-        bg_tex->LoadSubImage(320 * 0, 180 * 2, get_asset(19)); // 4, 5
-        bg_tex->LoadSubImage(320 * 1, 180 * 2, get_asset(20)); // 15
-        bg_tex->LoadSubImage(320 * 2, 180 * 2, get_asset(21)); // 19
-        bg_tex->LoadSubImage(320 * 3, 180 * 2, get_asset(22)); // 2, 3
+        bg_tex->LoadSubImage(320 * 0, 180 * 2, game_data.get_asset(19)); // 4, 5
+        bg_tex->LoadSubImage(320 * 1, 180 * 2, game_data.get_asset(20)); // 15
+        bg_tex->LoadSubImage(320 * 2, 180 * 2, game_data.get_asset(21)); // 19
+        bg_tex->LoadSubImage(320 * 3, 180 * 2, game_data.get_asset(22)); // 2, 3
 
-        bg_tex->LoadSubImage(320 * 0, 180 * 3, get_asset(23)); // 17
-        bg_tex->LoadSubImage(320 * 1, 180 * 3, get_asset(24)); // 18
-        bg_tex->LoadSubImage(320 * 2, 180 * 3, get_asset(26)); // 12
-
-        for(size_t i = 0; i < 5; i++) {
-            maps[i] = Map(get_asset(mapIds[i]));
-        }
-
-        for(auto el : spriteMapping) {
-            sprites[el.tile_id] = parse_sprite(get_asset(el.asset_id));
-        }
-
-        uvs = parse_uvs(get_asset(254));
+        bg_tex->LoadSubImage(320 * 0, 180 * 3, game_data.get_asset(23)); // 17
+        bg_tex->LoadSubImage(320 * 1, 180 * 3, game_data.get_asset(24)); // 18
+        bg_tex->LoadSubImage(320 * 2, 180 * 3, game_data.get_asset(26)); // 12
 
         undo_buffer.clear();
         redo_buffer.clear();
         updateRender();
         return true;
     } catch(std::exception& e) {
-        ErrorDialog.push(e.what());
+        error_dialog.push(e.what());
     }
 
     return false;
@@ -391,345 +350,12 @@ static void load_game_dialog() {
     std::string path;
     auto result = NFD::OpenDialog({{"Game", {"exe"}}}, lastPath.c_str(), path, window);
     if(result == NFD::Result::Error) {
-        ErrorDialog.push(NFD::GetError());
+        error_dialog.push(NFD::GetError());
     } else if(result == NFD::Result::Okay) {
         lastPath = path;
         load_game(path);
     }
 }
-
-static void DrawUvFlags(uv_data& uv) {
-    if(ImGui::BeginTable("uv_flags_table", 2)) {
-        uint32_t flags = uv.flags;
-
-        // clang-format off
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Collides left", &flags, 1 << 0); // correct
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Hidden", &flags, 1 << 10);
-
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Collides right", &flags, 1 << 1); // correct
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Blocks Light", &flags, 1 << 8);
-
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Collides up", &flags, 1 << 2); // correct
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("obscures", &flags, 1 << 6);
-
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Collides down", &flags, 1 << 3); // correct
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Contiguous", &flags, 1 << 7); // correct
-
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Not Placeable", &flags, 1 << 4);
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Self Contiguous", &flags, 1 << 9); // correct
-
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Additive", &flags, 1 << 5);
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Dirt", &flags, 1 << 11);
-
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("Has Normals", &flags, 1 << 12); // correct
-        ImGui::TableNextColumn(); ImGui::CheckboxFlags("UV Light", &flags, 1 << 13); // correct
-        // clang-format on
-
-        if(flags != uv.flags) {
-            uv.flags = flags;
-            updateRender();
-        }
-
-        ImGui::EndTable();
-    }
-}
-
-static void ImGui_draw_sprite(const SpriteData& sprite, int frame, glm::u16vec2 uv) {
-    auto atlasSize = glm::vec2(atlas->width, atlas->height);
-
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    auto pos = glm::vec2(p.x, p.y);
-
-    for(size_t j = 0; j < sprite.layers.size(); ++j) {
-        auto subsprite_id = sprite.compositions[frame * sprite.layers.size() + j];
-        if(subsprite_id >= sprite.sub_sprites.size())
-            continue;
-
-        auto& layer = sprite.layers[j];
-        if(layer.is_normals1 || layer.is_normals2 || !layer.is_visible) continue;
-
-        auto& subsprite = sprite.sub_sprites[subsprite_id];
-
-        auto aUv = glm::vec2(uv + subsprite.atlas_pos);
-        auto size = glm::vec2(subsprite.size);
-        auto ap = pos + glm::vec2(subsprite.composite_pos) * 8.0f;
-
-        draw_list->AddImage((ImTextureID)atlas->id.value, toImVec(ap), toImVec(ap + glm::vec2(subsprite.size) * 8.0f), toImVec(aUv / atlasSize), toImVec((aUv + size) / atlasSize));
-    }
-}
-
-class {
-    int selected_animation = 0;
-    bool playing = false;
-    int frame_step = 0;
-    int selected_frame = 0;
-    int selected_sprite = 0;
-
-  public:
-    void draw() {
-        if(!ImGui::Begin("Sprite Viewer")) {
-            ImGui::End();
-            return;
-        }
-        if(ImGui::InputInt("Id", &selected_sprite)) {
-            select(selected_sprite);
-        }
-
-        auto tile_id = spriteMapping[selected_sprite].tile_id;
-        auto& sprite = sprites[tile_id];
-        auto& uv = uvs[tile_id];
-
-        ImGui::Text("Composite size %i %i", sprite.size.x, sprite.size.y);
-        ImGui::Text("Layer count %zu", sprite.layers.size());
-        ImGui::Text("Subsprite count %zu", sprite.sub_sprites.size());
-
-        if(!sprite.animations.empty()) {
-            ImGui::NewLine();
-            if(ImGui::SliderInt("animation", &selected_animation, 0, std::max(0, (int)sprite.animations.size() - 1)) && playing) {
-                selected_frame = sprite.animations[selected_animation].start;
-            }
-            auto& anim = sprite.animations[selected_animation];
-            ImGui::InputScalar("start", ImGuiDataType_U16, &anim.start);
-            ImGui::InputScalar("end", ImGuiDataType_U16, &anim.end);
-            ImGui::InputScalar("frame_delay", ImGuiDataType_U16, &anim.frame_delay);
-
-            if(playing) {
-                frame_step++;
-                if(frame_step / 5 > anim.frame_delay) {
-                    selected_frame++;
-                    if(selected_frame > anim.end) {
-                        selected_frame = anim.start;
-                    }
-                    frame_step = 0;
-                }
-
-                if(ImGui::Button("Pause")) playing = false;
-            } else {
-                if(ImGui::Button("Play")) {
-                    playing = true;
-                    selected_frame = anim.start;
-                    frame_step = 0;
-                }
-            }
-        }
-
-        if(sprite.composition_count > 1) {
-            ImGui::NewLine();
-            ImGui::SliderInt("frame", &selected_frame, 0, sprite.composition_count - 1);
-        }
-
-        ImGui_draw_sprite(sprite, selected_frame, uv.pos);
-
-        ImGui::End();
-    }
-
-    void select(int id) {
-        selected_sprite = std::clamp(id, 0, 157);
-        selected_animation = 0;
-        selected_frame = 0;
-        playing = false;
-        frame_step = 0;
-    }
-
-    void select_from_tile(int tile_id) {
-        // todo: lazy implementation could be improved with map
-        auto spriteId = std::ranges::find(spriteMapping, tile_id, [](const TileMapping t) { return t.tile_id; })->internal_id;
-        select(spriteId);
-    }
-
-    void focus() {
-        ImGui::FocusWindow(ImGui::FindWindowByName("Sprite Viewer"));
-    }
-} SpriteViewer;
-
-class {
-  public:
-    int selected_tile;
-
-    void draw() {
-        if(!ImGui::Begin("Tile Viewer")) {
-            ImGui::End();
-            return;
-        }
-
-        ImGui::InputInt("Id", &selected_tile);
-        selected_tile = std::clamp(selected_tile, 0, (int)uvs.size() - 1);
-
-        auto& uv = uvs[selected_tile];
-
-        auto pos = glm::vec2(uv.pos);
-        auto size = glm::vec2(uv.size);
-        auto atlas_size = glm::vec2(atlas->width, atlas->height);
-
-        ImGui::Text("preview");
-        ImGui::Image((ImTextureID)atlas->id.value, toImVec(size * 8.0f), toImVec(pos / atlas_size), toImVec((pos + size) / atlas_size));
-
-        DrawUvFlags(uv);
-
-        ImGui::InputScalarN("UV", ImGuiDataType_U16, &uv.pos, 2);
-        ImGui::InputScalarN("UV Size", ImGuiDataType_U16, &uv.size, 2);
-
-        if(sprites.contains(selected_tile)) {
-            auto spriteId = std::ranges::find(spriteMapping, selected_tile, [](const TileMapping t) { return t.tile_id; })->internal_id;
-
-            ImGui::NewLine();
-            ImGui::Text("Sprite id %i", spriteId);
-            if(ImGui::Button("Open in Sprite Viewer")) {
-                SpriteViewer.select(spriteId);
-                SpriteViewer.focus();
-            }
-        }
-
-        ImGui::End();
-    }
-
-    void focus() {
-        ImGui::FocusWindow(ImGui::FindWindowByName("Tile Viewer"));
-    }
-} TileViewer;
-
-class {
-    int tile_id;
-    std::vector<glm::ivec3> results;
-    ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable;
-    bool show_on_map;
-
-  public:
-    void draw() {
-        auto& map = maps[selectedMap];
-
-        if(ImGui::Begin("Search")) {
-            ImGui::InputInt("tile_id", &tile_id);
-
-            if(ImGui::Button("Search")) {
-                results.clear();
-
-                for(auto& room : map.rooms) {
-                    for(int y2 = 0; y2 < 22; y2++) {
-                        for(int x2 = 0; x2 < 40; x2++) {
-                            auto tile1 = room.tiles[0][y2][x2];
-                            if(tile1.tile_id == tile_id) {
-                                results.emplace_back(room.x * 40 + x2, room.y * 22 + y2, 0);
-                            }
-
-                            auto tile2 = room.tiles[1][y2][x2];
-                            if(tile2.tile_id == tile_id) {
-                                results.emplace_back(room.x * 40 + x2, room.y * 22 + y2, 1);
-                            }
-                        }
-                    }
-                }
-            }
-            if(ImGui::Button("Clear")) {
-                results.clear();
-            }
-            ImGui::Checkbox("Highlight", &show_on_map);
-
-            const float TEXT_BASE_HEIGHT = ImGui::GetTextLineHeightWithSpacing();
-            // When using ScrollX or ScrollY we need to specify a size for our table container!
-            // Otherwise by default the table will fit all available space, like a BeginChild() call.
-            ImVec2 outer_size = ImVec2(0.0f, TEXT_BASE_HEIGHT * 8);
-
-            ImGui::Text("%zu results", results.size());
-            if(ImGui::BeginTable("search_results", 3, flags, outer_size)) {
-                ImGui::TableSetupScrollFreeze(0, 1); // Make top row always visible
-                ImGui::TableSetupColumn("x", ImGuiTableColumnFlags_None);
-                ImGui::TableSetupColumn("y", ImGuiTableColumnFlags_None);
-                ImGui::TableSetupColumn("layer", ImGuiTableColumnFlags_None);
-                ImGui::TableHeadersRow();
-
-                // Demonstrate using clipper for large vertical lists
-                ImGuiListClipper clipper;
-                clipper.Begin(results.size());
-                while(clipper.Step()) {
-                    for(int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-                        ImGui::TableNextRow();
-
-                        auto el = results[row];
-
-                        ImGui::TableSetColumnIndex(0);
-                        ImGui::Text("%i", el.x);
-                        ImGui::TableSetColumnIndex(1);
-                        ImGui::Text("%i", el.y);
-                        ImGui::TableSetColumnIndex(2);
-                        ImGui::Text("%i", el.z);
-                    }
-                }
-                ImGui::EndTable();
-            }
-        }
-        ImGui::End();
-
-        if(show_on_map) {
-            for(auto result : results) {
-                auto tile = map.getTile(result.z, result.x, result.y);
-                if(!tile.has_value())
-                    continue;
-
-                auto uv = uvs[tile->tile_id];
-
-                auto p = glm::vec2(result) * 8.0f;
-                overlay->AddRect(p, p + glm::vec2(uv.size), IM_COL32(255, 0, 0, 204), 8 / gScale);
-            }
-        }
-    }
-
-} SearchWindow;
-
-class {
-    std::vector<std::tuple<int, glm::vec2, glm::vec2>> tiles_;
-
-  public:
-    void draw() {
-        if(!ImGui::Begin("Tile List")) {
-            ImGui::End();
-            return;
-        }
-
-        if(tiles_.empty()) {
-            auto atlas_size = glm::vec2(atlas->width, atlas->height);
-
-            for(size_t i = 0; i < uvs.size(); ++i) {
-                auto uv = uvs[i];
-                if(uv.size == glm::u16vec2(0)) {
-                    continue;
-                }
-                tiles_.emplace_back(i, glm::vec2(uv.pos) / atlas_size, glm::vec2(uv.size) / atlas_size);
-            }
-
-            std::ranges::stable_sort(tiles_, {}, [](const auto el) { return std::get<2>(el).x * std::get<2>(el).y; });
-        }
-
-        auto width = ImGui::GetCurrentWindow()->WorkRect.GetWidth();
-        auto pad = ImGui::GetStyle().FramePadding.x;
-
-        for(const auto& [id, pos, size] : tiles_) {
-            ImGui::PushID(id);
-            if(ImGui::ImageButton((ImTextureID)atlas->id.value, ImVec2(32, 32), toImVec(pos), toImVec(pos + size))) {
-                TileViewer.selected_tile = id;
-                TileViewer.focus();
-            }
-            ImGui::SetItemTooltip("%i", id);
-            ImGui::PopID();
-            ImGui::SameLine();
-
-            auto x = ImGui::GetCursorPosX();
-            if(x + 32 + pad >= width) {
-                ImGui::NewLine();
-            }
-        }
-
-        ImGui::End();
-    }
-} TileList;
 
 static void dump_assets() {
     static std::string lastPath = std::filesystem::current_path().string();
@@ -743,13 +369,8 @@ static void dump_assets() {
     try {
         std::filesystem::create_directories(path);
 
-        auto sections = getSegmentOffsets(rawData);
-        auto assets = std::span((asset_entry*)sections.data.data(), 676);
-
-        std::vector<uint8_t> decrypted;
-
-        for(size_t i = 0; i < assets.size(); ++i) {
-            auto& item = assets[i];
+        for(size_t i = 0; i < game_data.assets.size(); ++i) {
+            auto& item = game_data.assets[i];
 
             std::string ext = ".bin";
             switch(item.type) {
@@ -782,18 +403,14 @@ static void dump_assets() {
                     break;
             }
 
-            auto dat = sections.get_rdata_ptr(item.ptr, item.length);
+            auto dat = game_data.get_asset(i);
 
             std::ofstream file(path + "/" + std::to_string(i) + ext, std::ios::binary);
-            if(tryDecrypt(item, dat, decrypted)) {
-                file.write((char*)decrypted.data(), decrypted.size());
-            } else {
-                file.write((char*)dat.data(), dat.size());
-            }
+            file.write((char*)dat.data(), dat.size());
             file.close();
         }
     } catch(std::exception& e) {
-        ErrorDialog.push(e.what());
+        error_dialog.push(e.what());
     }
 }
 
@@ -839,7 +456,7 @@ static void randomize() {
     target.insert(711); // = 65th egg
     target.insert(780); // = f.pack
 
-    auto& map = maps[0];
+    auto& map = game_data.maps[0];
 
     for(auto& room : map.rooms) {
         for(int y2 = 0; y2 < 22; y2++) {
@@ -925,7 +542,7 @@ class {
         auto result = NFD::SaveDialog({{"Game", {"exe"}}}, export_path.c_str(), path, window);
 
         if(result == NFD::Result::Error) {
-            ErrorDialog.push(NFD::GetError());
+            error_dialog.push(NFD::GetError());
             return;
         }
         if(result == NFD::Result::Cancel) {
@@ -948,91 +565,16 @@ class {
   private:
     void export_exe() {
         try {
-            auto out = rawData;
-            auto sections = getSegmentOffsets(out);
-            auto assets = std::span((asset_entry*)sections.data.data(), 676);
+            auto out = game_data; // make copy for exporting
+            out.apply_changes();
 
-            bool error = false;
+            if(patch_renderdoc)
+                out.patch_renderdoc();
 
-            auto replaceAsset = [&](const std::vector<uint8_t>& data, int id) {
-                auto& asset = assets[id];
-                auto ptr = sections.get_rdata_ptr(asset.ptr, asset.length);
-
-                if(((uint8_t)asset.type & 192) == 64) {
-                    int key = 0; // 193, 212, 255, 300
-                    if(id == 30 || id == 52) key = 1;
-                    else if(id == 222 || id == 277 || id == 377) key = 2;
-
-                    auto enc = encrypt(data, key);
-
-                    if(enc.size() > asset.length) {
-                        error = true;
-                        ErrorDialog.pushf("Failed to save asset %i because it was too big", id);
-                    } else {
-                         // asset.length = enc.size(); // keep default value cause game doesn't really use length anyway
-                        std::memcpy(ptr.data(), enc.data(), enc.size());
-                    }
-                } else {
-                    if(data.size() > asset.length) {
-                        error = true;
-                        ErrorDialog.pushf("Failed to save asset %i because it was too big", id);
-                    } else {
-                        std::memcpy(ptr.data(), data.data(), data.size());
-                    }
-                }
-            };
-
-            for(size_t i = 0; i < 5; i++) {
-                replaceAsset(maps[i].save(), mapIds[i]);
-            }
-            replaceAsset(save_uvs(uvs), 254);
-
-            /*if(patch_steam) {
-                // patch steam restart
-                out[0xEFE6] = 0x48; // MOV AL, 0
-                out[0xEFE7] = 0xc6;
-                out[0xEFE8] = 0xc0;
-                out[0xEFE9] = 0x00;
-
-                out[0xEFEA] = 0x48; // NOP
-                out[0xEFEB] = 0x90;
-            }*/
-
-            if(patch_renderdoc) {
-                constexpr char pattern[] = "renderdoc.dll";
-                auto res = std::search(out.begin(), out.end(), std::begin(pattern), std::end(pattern));
-                if(res != out.end()) {
-                    *res = 'l'; // replace first letter with 'l'
-                }
-            }
-
-            {
-                const char* default_save = (const char*)(L"AnimalWell.sav");
-                auto res = std::search(out.begin(), out.end(), default_save, default_save + 30);
-
-                if(res != out.end()) {
-                    std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-                    auto wstr = converter.from_bytes(save_name);
-
-                    for(int i = 0; i < wstr.size() + 1; ++i) {
-                        auto c = wstr[i];
-                        *res = c & 0xFF;
-                        ++res;
-                        *res = c >> 8;
-                        ++res;
-                    }
-                }
-            }
-
-            if(!error) {
-                std::ofstream file(export_path, std::ios::binary);
-                file.exceptions(std::ofstream::failbit | std::ofstream::badbit);
-                file.write(out.data(), out.size());
-
-                has_exported = true;
-            }
+            out.patch_save_path(save_name);
+            out.save(export_path);
         } catch(std::exception& e) {
-            ErrorDialog.push(e.what());
+            error_dialog.push(e.what());
         }
     }
 } exe_exporter;
@@ -1065,7 +607,7 @@ class {
         auto result = NFD::SaveDialog({{"Map", {"map"}}}, export_path.c_str(), path, window);
 
         if(result == NFD::Result::Error) {
-            ErrorDialog.push(NFD::GetError());
+            error_dialog.push(NFD::GetError());
             return;
         }
         if(result == NFD::Result::Cancel) {
@@ -1086,23 +628,93 @@ class {
   private:
     void export_map() {
         try {
-            auto data = maps[selectedMap].save();
+            auto data = game_data.maps[selectedMap].save();
             std::ofstream file(export_path, std::ios::binary);
             file.exceptions(std::ofstream::failbit | std::ofstream::badbit);
             file.write((char*)data.data(), data.size());
 
             has_exported = true;
         } catch(std::exception& e) {
-            ErrorDialog.push(e.what());
+            error_dialog.push(e.what());
         }
     }
 } map_exporter;
+
+void full_map_screenshot(ShaderProgram& textured_shader) {
+    static std::string export_path = std::filesystem::current_path().string() + "/map.png";
+    std::string path;
+    auto result = NFD::SaveDialog({{"png", {"png"}}}, export_path.c_str(), path, window);
+
+    if(result == NFD::Result::Error) {
+        error_dialog.push(NFD::GetError());
+        return;
+    }
+    if(result == NFD::Result::Cancel) {
+        return;
+    }
+    export_path = path;
+
+    auto& map = game_data.maps[selectedMap];
+    auto room_size = glm::ivec2(40, 22);
+    auto size = glm::ivec2(map.size.x, map.size.y) * room_size * 8;
+
+    glViewport(0, 0, size.x, size.y);
+
+    Textured_Framebuffer fb(size.x, size.y);
+    fb.Bind();
+
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glm::mat4 MVP = glm::ortho<float>(0, size.x, 0, size.y, 0.0f, 100.0f) *
+                    glm::lookAt(
+                        glm::vec3(map.offset * room_size * 8, 3),
+                        glm::vec3(map.offset * room_size * 8, 0),
+                        glm::vec3(0, 1, 0));
+
+    textured_shader.Use();
+    textured_shader.setMat4("MVP", MVP);
+
+    if(show_bg_tex) { // draw background textures
+        textured_shader.setVec4("color", bg_tex_color);
+        bg_tex->Bind();
+        bg_text->Draw();
+    }
+
+    atlas->Bind();
+    if(show_bg) { // draw background tiles
+        textured_shader.setVec4("color", bg_color);
+        bg_tiles->Draw();
+    }
+    if(show_fg) { // draw foreground tiles
+        textured_shader.setVec4("color", fg_color);
+        fg_tiles->Draw();
+    }
+
+    // draw overlay (selection, water level)
+    // flat_shader.Use();
+    // flat_shader.setMat4("MVP", MVP);
+    // overlay->Buffer();
+    // overlay->Draw();
+
+    std::vector<uint8_t> img(size.x * size.y * sizeof(uint32_t));
+    fb.tex.Bind();
+    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.data());
+    stbi_write_png(path.c_str(), size.x, size.y, 4, img.data(), size.x * sizeof(uint32_t));
+
+    // restore viewport
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    int width, height;
+    glfwGetFramebufferSize(window, &width, &height);
+    glViewport(0, 0, width, height);
+}
 
 // Tips: Use with ImGuiDockNodeFlags_PassthruCentralNode!
 // The limitation with this call is that your window won't have a menu bar.
 // Even though we could pass window flags, it would also require the user to be able to call BeginMenuBar() somehow meaning we can't Begin/End in a single function.
 // But you can also use BeginMainMenuBar(). If you really want a menu bar inside the same window as the one hosting the dockspace, you will need to copy this code somewhere and tweak it.
-static ImGuiID DockSpaceOverViewport() {
+static ImGuiID DockSpaceOverViewport(ShaderProgram& textured_shader) {
     auto viewport = ImGui::GetMainViewport();
 
     ImGui::SetNextWindowPos(viewport->WorkPos);
@@ -1132,7 +744,7 @@ static ImGuiID DockSpaceOverViewport() {
                 load_game_dialog();
             }
 
-            ImGui::BeginDisabled(rawData.empty());
+            ImGui::BeginDisabled(!game_data.loaded);
             exe_exporter.draw_options();
             ImGui::EndDisabled();
 
@@ -1144,35 +756,35 @@ static ImGuiID DockSpaceOverViewport() {
                 auto result = NFD::OpenDialog({{"Map", {"map"}}}, lastPath.c_str(), path, window);
 
                 if(result == NFD::Result::Error) {
-                    ErrorDialog.push(NFD::GetError());
+                    error_dialog.push(NFD::GetError());
                 } else if(result == NFD::Result::Okay) {
                     lastPath = path;
                     try {
                         auto data = readFile(path.c_str());
                         auto map = Map(std::span((uint8_t*)data.data(), data.size()));
 
-                        if(map.coordinate_map != maps[selectedMap].coordinate_map) {
-                            ErrorDialog.push("Warning map structure differs from previously loaded map.\nMight break things so be careful.");
+                        if(map.coordinate_map != game_data.maps[selectedMap].coordinate_map) {
+                            error_dialog.push("Warning map structure differs from previously loaded map.\nMight break things so be careful.");
                         }
 
-                        maps[selectedMap] = map;
+                        game_data.maps[selectedMap] = map;
 
                         undo_buffer.clear();
                         redo_buffer.clear();
                         updateRender();
                     } catch(std::exception& e) {
-                        ErrorDialog.push(e.what());
+                        error_dialog.push(e.what());
                     }
                 }
             }
 
-            ImGui::BeginDisabled(rawData.empty());
+            ImGui::BeginDisabled(!game_data.loaded);
             map_exporter.draw_options();
             ImGui::EndDisabled();
 
             ImGui::Separator();
 
-            ImGui::BeginDisabled(rawData.empty());
+            ImGui::BeginDisabled(!game_data.loaded);
             if(ImGui::MenuItem("Dump assets")) {
                 dump_assets();
             }
@@ -1204,14 +816,20 @@ static ImGuiID DockSpaceOverViewport() {
         }
 
         if(ImGui::BeginMenu("Tools")) {
+            ImGui::BeginDisabled(!game_data.loaded);
+
             if(ImGui::MenuItem("Randomize items")) {
                 randomize();
             }
             if(ImGui::MenuItem("Make everything transparent")) {
-                for(auto& uv : uvs) {
+                for(auto& uv : game_data.uvs) {
                     uv.blocks_light = false;
                 }
             }
+            if(ImGui::MenuItem("Export Full Map Screenshot")) {
+                full_map_screenshot(textured_shader);
+            }
+            ImGui::EndDisabled();
 
             ImGui::EndMenu();
         }
@@ -1278,22 +896,22 @@ static bool GetKeyUp(ImGuiKey key) {
 
 static glm::ivec2 arrow_key_dir() {
     if(ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
-        return glm::ivec2(0, -1);
+        return {0, -1};
     }
     if(ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
-        return glm::ivec2(0, 1);
+        return {0, 1};
     }
     if(ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) {
-        return glm::ivec2(-1, 0);
+        return {-1, 0};
     }
     if(ImGui::IsKeyPressed(ImGuiKey_RightArrow)) {
-        return glm::ivec2(1, 0);
+        return {1, 0};
     }
-    return glm::ivec2(0);
+    return {0, 0};
 }
 
 static void handle_input() {
-    if(rawData.empty()) return; // no map loaded
+    if(!game_data.loaded) return; // no map loaded
 
     ImGuiIO& io = ImGui::GetIO();
 
@@ -1337,10 +955,10 @@ static void handle_input() {
                 selection_handler.release();
             }
             if(GetKey(ImGuiMod_Ctrl)) {
-                if(GetKeyDown(ImGuiKey_C)) clipboard.copy(maps[selectedMap], selection_handler.start(), selection_handler.size());
+                if(GetKeyDown(ImGuiKey_C)) clipboard.copy(game_data.maps[selectedMap], selection_handler.start(), selection_handler.size());
                 if(GetKeyDown(ImGuiKey_X)) {
                     selection_handler.apply();
-                    clipboard.cut(maps[selectedMap], selection_handler.start(), selection_handler.size());
+                    clipboard.cut(game_data.maps[selectedMap], selection_handler.start(), selection_handler.size());
                     push_undo(std::make_unique<AreaChange>(selection_handler.start(), clipboard));
                     updateRender();
                 }
@@ -1353,7 +971,7 @@ static void handle_input() {
             selection_handler.start_from_paste(mouse_world_pos, clipboard.size());
 
             // put copied tiles down
-            clipboard.paste(maps[selectedMap], {mouse_world_pos, selectLayer});
+            clipboard.paste(game_data.maps[selectedMap], {mouse_world_pos, selectLayer});
             // selection_handler will push undo data once position is finalized
             updateRender();
         }
@@ -1412,7 +1030,7 @@ static void DrawPreviewWindow() {
         }
 
         auto room_pos = tile_location / room_size;
-        auto room = maps[selectedMap].getRoom(room_pos.x, room_pos.y);
+        auto room = game_data.maps[selectedMap].getRoom(room_pos.x, room_pos.y);
 
         ImGui::Text("world pos %i %i", tile_location.x, tile_location.y);
 
@@ -1422,7 +1040,7 @@ static void DrawPreviewWindow() {
             ImGui::InputScalar("water level", ImGuiDataType_U8, &room->waterLevel);
             uint8_t bg_min = 0, bg_max = 18;
             if(ImGui::SliderScalar("background id", ImGuiDataType_U8, &room->bgId, &bg_min, &bg_max)) {
-                renderBgs(maps[selectedMap], *bg_text);
+                renderBgs(game_data.maps[selectedMap], *bg_text);
             }
 
             ImGui::InputScalar("pallet_index", ImGuiDataType_U8, &room->pallet_index);
@@ -1473,18 +1091,20 @@ static void DrawPreviewWindow() {
 
             ImGui::SeparatorText("Tile Data");
             ImGui::BeginDisabled(tile_layer == 2);
-            DrawUvFlags(uvs[tile.tile_id]);
+            if(DrawUvFlags(game_data.uvs[tile.tile_id])) {
+                updateRender();
+            }
             ImGui::EndDisabled();
 
-            if(sprites.contains(tile.tile_id)) {
+            if(game_data.sprites.contains(tile.tile_id)) {
                 // todo: lazy implementation could be improved with map
                 auto spriteId = std::ranges::find(spriteMapping, tile.tile_id, [](const TileMapping t) { return t.tile_id; })->internal_id;
 
                 ImGui::NewLine();
                 ImGui::Text("Sprite id %i", spriteId);
                 if(ImGui::Button("Open in Sprite Viewer")) {
-                    SpriteViewer.select_from_tile(tile.tile_id);
-                    SpriteViewer.focus();
+                    sprite_viewer.select_from_tile(tile.tile_id);
+                    sprite_viewer.focus();
                 }
             }
         }
@@ -1509,7 +1129,7 @@ ctrl + y to redo.");
         ImGui::Text("world pos %i %i", mouse_world_pos.x, mouse_world_pos.y);
 
         auto room_pos = mouse_world_pos / room_size;
-        auto room = maps[selectedMap].getRoom(room_pos.x, room_pos.y);
+        auto room = game_data.maps[selectedMap].getRoom(room_pos.x, room_pos.y);
 
         if(!io.WantCaptureMouse && room != nullptr) {
             if(glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE)) {
@@ -1568,7 +1188,7 @@ ctrl + y to redo.");
             ImGui::EndTable();
         }
 
-        auto& uv = uvs[placing.tile_id];
+        auto& uv = game_data.uvs[placing.tile_id];
 
         auto pos = glm::vec2(uv.pos);
         auto size = glm::vec2(uv.size);
@@ -1586,7 +1206,7 @@ static void draw_water_level() {
         return;
     }
 
-    const Map& map = maps[selectedMap];
+    const Map& map = game_data.maps[selectedMap];
 
     for(const Room& room : map.rooms) {
         if(room.waterLevel >= 176) {
@@ -1614,7 +1234,7 @@ static void draw_overlay() {
         }
 
         auto room_pos = tile_location / room_size;
-        auto room = maps[selectedMap].getRoom(room_pos.x, room_pos.y);
+        auto room = game_data.maps[selectedMap].getRoom(room_pos.x, room_pos.y);
 
         if(room != nullptr) {
             auto tp = glm::ivec2(tile_location.x % 40, tile_location.y % 22);
@@ -1629,8 +1249,8 @@ static void draw_overlay() {
 
             auto pos = glm::vec2(tile_location) * 8.0f;
 
-            if(sprites.contains(tile.tile_id)) {
-                auto sprite = sprites[tile.tile_id];
+            if(game_data.sprites.contains(tile.tile_id)) {
+                auto sprite = game_data.sprites[tile.tile_id];
                 auto bb_max = pos + glm::vec2(8, 8);
 
                 int composition_id = 0;
@@ -1660,7 +1280,7 @@ static void draw_overlay() {
 
                 overlay->AddRect(pos, bb_max, IM_COL32(255, 255, 255, 204), 1);
             } else if(tile.tile_id != 0) {
-                overlay->AddRect(pos, pos + glm::vec2(uvs[tile.tile_id].size), IM_COL32_WHITE, 1);
+                overlay->AddRect(pos, pos + glm::vec2(game_data.uvs[tile.tile_id].size), IM_COL32_WHITE, 1);
             } else {
                 overlay->AddRect(pos, pos + glm::vec2(8), IM_COL32_WHITE, 1);
             }
@@ -1670,7 +1290,7 @@ static void draw_overlay() {
     } else if(mouse_mode == 1) {
         auto mouse_world_pos = screen_to_world(mousePos);
         auto room_pos = mouse_world_pos / room_size;
-        auto room = maps[selectedMap].getRoom(room_pos.x, room_pos.y);
+        auto room = game_data.maps[selectedMap].getRoom(room_pos.x, room_pos.y);
 
         if(room != nullptr) {
             if(!room_grid) overlay->AddRect(room_pos * room_size * 8, room_pos * room_size * 8 + glm::ivec2(40, 22) * 8, IM_COL32(255, 255, 255, 127), 1);
@@ -1695,7 +1315,7 @@ static void draw_overlay() {
     }
 
     if(room_grid) {
-        const auto& map = maps[selectedMap];
+        const auto& map = game_data.maps[selectedMap];
 
         for(int i = 0; i <= map.size.x; i++) {
             auto x = (map.offset.x + i) * 40 * 8;
@@ -1849,20 +1469,35 @@ int runViewer() {
         MVP = projection * view;
 
         handle_input();
-        DockSpaceOverViewport();
-        ErrorDialog.draw();
+        DockSpaceOverViewport(textured_shader);
+        error_dialog.draw();
         exe_exporter.draw_popup();
 
         // skip rendering if no data is loaded
-        if(!rawData.empty()) {
-            SearchWindow.draw();
-            TileList.draw();
-            TileViewer.draw();
-            SpriteViewer.draw();
+        if(game_data.loaded) {
+            bool should_update = false;
+
+            search_window.draw(game_data, [](int map, const glm::ivec2 pos) {
+                if(map != selectedMap) {
+                    selectedMap = map;
+                    updateRender();
+                }
+                // center of screen
+                auto center = glm::vec2(glm::inverse(projection * view) * glm::vec4(0, 0, 0, 1));
+                auto delta = glm::vec2(pos * 8) + glm::vec2(4, 4) - center;
+                view = glm::translate(view, glm::vec3(-delta, 0));
+            });
+            tile_list.draw(game_data, *atlas);
+            tile_viewer.draw(game_data, *atlas, should_update);
+            sprite_viewer.draw(game_data, *atlas);
             DrawPreviewWindow();
+
+            if(should_update)
+                updateRender();
 
             draw_overlay();
             draw_water_level();
+            search_window.draw_overlay(game_data, selectedMap, *overlay, gScale);
 
             glClearColor(0.45f, 0.55f, 0.60f, 1.00f);
             glClear(GL_COLOR_BUFFER_BIT);
